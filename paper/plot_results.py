@@ -25,30 +25,53 @@ RESULTS = {
     'NanoMamba-Tiny-DualPCEN': {
         'params': 4957,
         'label': 'NanoMamba (5.0K)',
-        'factory': [60.9, 67.7, 78.5, 85.2, 88.8, 91.4, 91.6, 93.7],
-        'white':   [36.2, 60.4, 74.4, 83.7, 88.7, 90.8, 92.3, 93.8],
-        'babble':  [70.0, 77.3, 85.4, 89.4, 91.8, 92.7, 92.9, 93.8],
-        'street':  [58.4, 62.7, 74.0, 82.1, 87.8, 90.5, 92.2, 93.7],
-        'pink':    [24.1, 57.1, 76.3, 84.9, 89.5, 91.9, 93.2, 93.7],
+        'factory': [58.6, 68.9, 79.0, 85.8, 89.0, 91.1, 91.8, 93.7],
+        'white':   [37.6, 58.3, 74.7, 83.6, 88.4, 91.0, 92.3, 93.6],
+        'babble':  [70.6, 77.7, 85.1, 89.3, 91.6, 92.3, 93.0, 93.8],
+        'street':  [58.2, 64.6, 71.7, 83.3, 87.3, 91.0, 92.4, 93.8],
+        'pink':    [28.3, 56.7, 75.4, 84.8, 89.4, 91.9, 93.2, 93.8],
     },
     'DS-CNN-S': {
         'params': 23756,
         'label': 'DS-CNN-S (23.8K)',
-        'factory': [64.9, 74.6, 86.5, 91.5, 94.0, 95.1, 95.9, 96.8],
-        'white':   [61.4, 66.5, 81.8, 90.0, 93.1, 94.7, 95.6, 96.8],
-        'babble':  [77.0, 85.3, 90.7, 94.2, 95.5, 96.1, 96.5, 96.8],
-        'street':  [62.1, 69.4, 81.4, 89.6, 92.6, 94.9, 95.7, 96.8],
-        'pink':    [60.9, 66.5, 81.9, 90.6, 93.5, 94.8, 95.9, 96.8],
+        'factory': [64.4, 74.6, 85.9, 91.5, 93.8, 95.1, 95.5, 96.8],
+        'white':   [61.7, 67.1, 81.6, 89.9, 93.1, 94.8, 95.6, 96.8],
+        'babble':  [79.2, 86.2, 91.4, 94.5, 95.5, 95.9, 96.5, 96.8],
+        'street':  [61.1, 69.4, 81.5, 88.9, 92.8, 95.0, 95.9, 96.8],
+        'pink':    [61.2, 66.4, 82.7, 90.6, 93.8, 95.1, 95.9, 96.8],
     },
     'BC-ResNet-1': {
         'params': 7464,
         'label': 'BC-ResNet-1 (7.5K)',
-        'factory': [65.7, 75.0, 83.6, 89.4, 92.2, 93.0, 93.9, 95.3],
-        'white':   [59.3, 64.5, 77.3, 85.7, 90.2, 92.7, 93.8, 95.3],
-        'babble':  [76.3, 84.4, 89.1, 91.9, 93.7, 94.7, 94.7, 95.3],
-        'street':  [60.6, 64.4, 76.1, 85.3, 90.5, 93.0, 94.1, 95.3],
-        'pink':    [59.6, 65.6, 79.7, 88.2, 91.7, 93.6, 94.4, 95.3],
+        'factory': [64.5, 74.8, 83.5, 89.0, 91.9, 92.9, 93.9, 95.3],
+        'white':   [58.6, 64.6, 76.7, 85.9, 90.2, 92.6, 93.8, 95.3],
+        'babble':  [76.7, 84.3, 88.8, 92.1, 93.8, 94.4, 95.0, 95.3],
+        'street':  [60.7, 65.1, 77.7, 84.8, 90.1, 93.0, 94.1, 95.3],
+        'pink':    [58.9, 66.0, 79.7, 88.4, 91.8, 93.8, 94.5, 95.3],
     },
+}
+
+# ============================================================================
+# DualPCEN Routing Analysis Data (gate mean per noise type/SNR)
+# Gate: 0=Expert1(nonstat, speech), 1=Expert2(stat, noise-robust)
+# ============================================================================
+ROUTING_DATA = {
+    'clean':       {'mean': 0.6289, 'std': 0.0419},
+    'factory_-15': {'mean': 0.6064, 'std': 0.0054},
+    'factory_0':   {'mean': 0.6193, 'std': 0.0147},
+    'factory_15':  {'mean': 0.6176, 'std': 0.0250},
+    'white_-15':   {'mean': 0.6719, 'std': 0.0019},
+    'white_0':     {'mean': 0.6806, 'std': 0.0078},
+    'white_15':    {'mean': 0.6724, 'std': 0.0167},
+    'babble_-15':  {'mean': 0.5219, 'std': 0.0213},
+    'babble_0':    {'mean': 0.5520, 'std': 0.0316},
+    'babble_15':   {'mean': 0.5920, 'std': 0.0404},
+    'street_-15':  {'mean': 0.6965, 'std': 0.0017},
+    'street_0':    {'mean': 0.7009, 'std': 0.0050},
+    'street_15':   {'mean': 0.6802, 'std': 0.0159},
+    'pink_-15':    {'mean': 0.7706, 'std': 0.0016},
+    'pink_0':      {'mean': 0.7605, 'std': 0.0033},
+    'pink_15':     {'mean': 0.7250, 'std': 0.0164},
 }
 
 # ============================================================================
@@ -554,6 +577,199 @@ def plot_structural_summary():
 
 
 # ============================================================================
+# Fig I: Clean-Only Trained — Per Noise Type (large, detailed)
+# ============================================================================
+def plot_per_noise_clean_only():
+    """Individual noise plots for clean-only trained models (no noise-aug)."""
+    clean_noise_types = ['factory', 'white', 'babble']
+    clean_noise_labels = {'factory': 'Factory', 'white': 'White (Broadband)',
+                          'babble': 'Babble (Non-stationary)'}
+    snr_ticks_co = list(range(7))  # 0..6 for 7 data points
+    snr_labels_co = ['-15', '-10', '-5', '0', '5', '10', '15']
+
+    for noise in clean_noise_types:
+        fig, ax = plt.subplots(figsize=(6, 4))
+
+        for model_name, data in RESULTS_CLEAN_ONLY.items():
+            s = MODEL_STYLES[model_name]
+            vals = data[noise]
+            ax.plot(snr_ticks_co, vals,
+                    color=s['color'], marker=s['marker'],
+                    linestyle=s['ls'], linewidth=s['lw'] + 0.3,
+                    markersize=s['ms'] + 1, zorder=s['zorder'],
+                    label=data['label'])
+            # Annotate each point
+            for xi, yi in zip(snr_ticks_co, vals):
+                if model_name == 'NanoMamba-Tiny-DualPCEN':
+                    offset_y = 3.5
+                elif model_name == 'DS-CNN-S':
+                    offset_y = -5.5
+                else:
+                    offset_y = -5.5 if yi < vals[-1] * 0.95 else 3.5
+                ax.annotate(f'{yi:.1f}', (xi, yi),
+                            textcoords="offset points",
+                            xytext=(0, offset_y),
+                            ha='center', fontsize=7.5,
+                            color=s['color'], fontweight='bold')
+
+        # Highlight zones
+        ax.axhspan(90, 100, color='green', alpha=0.04)
+        ax.axhspan(0, 50, color='red', alpha=0.05)
+        ax.axhline(y=90, color='gray', ls=':', lw=0.8, alpha=0.5)
+
+        # Gap annotation at 0dB (index 3)
+        nm_0db = RESULTS_CLEAN_ONLY['NanoMamba-Tiny-DualPCEN'][noise][3]
+        ds_0db = RESULTS_CLEAN_ONLY['DS-CNN-S'][noise][3]
+        gap = nm_0db - ds_0db  # NanoMamba wins in clean-only!
+        gap_color = '#2563EB' if gap > 0 else '#DC2626'
+        gap_text = f'NanoMamba +{gap:.1f}%p' if gap > 0 else f'DS-CNN-S +{-gap:.1f}%p'
+        ax.annotate(gap_text,
+                    xy=(3, (nm_0db + ds_0db) / 2),
+                    fontsize=8, color=gap_color, ha='left',
+                    fontweight='bold',
+                    xytext=(3.5, (nm_0db + ds_0db) / 2 + 3),
+                    bbox=dict(boxstyle='round,pad=0.3',
+                              facecolor='#EFF6FF', edgecolor=gap_color, alpha=0.9))
+
+        # White noise: highlight DS-CNN-S collapse
+        if noise == 'white':
+            ax.annotate('DS-CNN-S COLLAPSE\n(near random)',
+                        xy=(3, ds_0db), fontsize=8,
+                        color='#DC2626', ha='center', fontweight='bold',
+                        xytext=(4.5, 25),
+                        arrowprops=dict(arrowstyle='->', color='#DC2626', lw=1.5))
+
+        ax.set_title(f'{clean_noise_labels[noise]} Noise - Clean-Only Trained\n(NO noise augmentation)',
+                     fontsize=12, fontweight='bold')
+        ax.set_xticks(snr_ticks_co)
+        ax.set_xticklabels(snr_labels_co, fontsize=9)
+        ax.set_xlabel('SNR (dB)', fontsize=11)
+        ax.set_ylabel('Accuracy (%)', fontsize=11)
+        y_min = 5 if noise == 'white' else 25
+        ax.set_ylim(y_min, 100)
+        ax.legend(fontsize=9, loc='lower right',
+                  framealpha=0.9, edgecolor='gray')
+
+        info = "Clean-only trained (structural robustness only, NO noise in training)"
+        ax.text(0.5, 0.02, info, transform=ax.transAxes,
+                fontsize=7, ha='center', color='#B45309', style='italic',
+                fontweight='bold')
+
+        fig.tight_layout()
+        out = os.path.join(OUT_DIR, f'fig_cleanonly_{noise}.{EXT}')
+        fig.savefig(out)
+        plt.close(fig)
+        print(f"  Saved: {out}")
+
+
+# ============================================================================
+# Fig J: DualPCEN Routing Analysis Heatmap
+# ============================================================================
+def plot_routing_analysis():
+    """Heatmap of DualPCEN gate values across noise types and SNR levels.
+    Shows how the routing adapts: babble→Expert1 (nonstat), pink→Expert2 (stat)."""
+    noise_types_r = ['factory', 'white', 'babble', 'street', 'pink']
+    snr_levels_r = [-15, 0, 15]
+    snr_labels_r = ['-15 dB', '0 dB', '15 dB']
+
+    # Build heatmap matrix (noise × SNR)
+    n_noise = len(noise_types_r)
+    n_snr = len(snr_levels_r) + 1  # +1 for clean
+    gate_matrix = np.zeros((n_noise, n_snr))
+    std_matrix = np.zeros((n_noise, n_snr))
+
+    for i, noise in enumerate(noise_types_r):
+        for j, snr in enumerate(snr_levels_r):
+            key = f'{noise}_{snr}'
+            gate_matrix[i, j] = ROUTING_DATA[key]['mean']
+            std_matrix[i, j] = ROUTING_DATA[key]['std']
+        # Clean column (same for all noise types)
+        gate_matrix[i, n_snr - 1] = ROUTING_DATA['clean']['mean']
+        std_matrix[i, n_snr - 1] = ROUTING_DATA['clean']['std']
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4),
+                                     gridspec_kw={'width_ratios': [3, 2]})
+
+    # --- Left: Heatmap ---
+    col_labels = snr_labels_r + ['Clean']
+    row_labels = [NOISE_LABELS[n] for n in noise_types_r]
+
+    im = ax1.imshow(gate_matrix, cmap='RdYlBu_r', aspect='auto',
+                     vmin=0.48, vmax=0.80)
+
+    ax1.set_xticks(range(n_snr))
+    ax1.set_xticklabels(col_labels, fontsize=9)
+    ax1.set_yticks(range(n_noise))
+    ax1.set_yticklabels(row_labels, fontsize=9)
+
+    # Annotate values
+    for i in range(n_noise):
+        for j in range(n_snr):
+            val = gate_matrix[i, j]
+            std = std_matrix[i, j]
+            color = 'white' if val > 0.70 or val < 0.55 else 'black'
+            ax1.text(j, i, f'{val:.3f}\n({std:.3f})',
+                     ha='center', va='center', fontsize=7.5,
+                     fontweight='bold', color=color)
+
+    ax1.set_title('DualPCEN Gate Value (0=Expert1/nonstat, 1=Expert2/stat)',
+                   fontweight='bold', fontsize=10)
+    cbar = fig.colorbar(im, ax=ax1, shrink=0.8, pad=0.02)
+    cbar.set_label('Gate Mean', fontsize=8)
+
+    # Add arrows for interpretation
+    ax1.annotate('More Expert2\n(noise-robust)',
+                 xy=(0, 4), xytext=(-0.8, 4),
+                 fontsize=7, color='#DC2626', fontweight='bold',
+                 ha='right', va='center')
+    ax1.annotate('More Expert1\n(speech-focused)',
+                 xy=(0, 2), xytext=(-0.8, 2),
+                 fontsize=7, color='#2563EB', fontweight='bold',
+                 ha='right', va='center')
+
+    # --- Right: Bar chart of gate separation from clean ---
+    separations = {}
+    for noise in noise_types_r:
+        key_m15 = f'{noise}_-15'
+        sep = ROUTING_DATA[key_m15]['mean'] - ROUTING_DATA['clean']['mean']
+        separations[noise] = sep
+
+    noise_labels_list = [NOISE_LABELS[n] for n in noise_types_r]
+    sep_vals = [separations[n] for n in noise_types_r]
+    colors_bar = ['#DC2626' if v > 0 else '#2563EB' for v in sep_vals]
+
+    bars = ax2.barh(range(n_noise), sep_vals, color=colors_bar, alpha=0.8,
+                     edgecolor='white', linewidth=0.8)
+    ax2.set_yticks(range(n_noise))
+    ax2.set_yticklabels(noise_labels_list, fontsize=9)
+    ax2.axvline(x=0, color='gray', lw=1, ls='-')
+    ax2.set_xlabel('Gate Separation from Clean', fontsize=9)
+    ax2.set_title('Routing Shift at -15dB\n(vs Clean baseline)',
+                   fontweight='bold', fontsize=10)
+
+    for i, (bar, val) in enumerate(zip(bars, sep_vals)):
+        sign = '+' if val > 0 else ''
+        x_pos = val + 0.005 if val > 0 else val - 0.005
+        ha = 'left' if val > 0 else 'right'
+        ax2.text(x_pos, i, f'{sign}{val:.3f}', va='center', ha=ha,
+                 fontsize=8, fontweight='bold', color=colors_bar[i])
+
+    # Legend annotation
+    ax2.text(0.95, 0.05,
+             'Red: → Expert2 (stat/AGC)\nBlue: → Expert1 (nonstat/speech)',
+             transform=ax2.transAxes, fontsize=7,
+             va='bottom', ha='right',
+             bbox=dict(boxstyle='round,pad=0.4', facecolor='#F9FAFB',
+                       edgecolor='#D1D5DB'))
+
+    fig.tight_layout()
+    out = os.path.join(OUT_DIR, f'fig_routing_analysis.{EXT}')
+    fig.savefig(out)
+    plt.close(fig)
+    print(f"  Saved: {out}")
+
+
+# ============================================================================
 # Main
 # ============================================================================
 if __name__ == '__main__':
@@ -568,6 +784,8 @@ if __name__ == '__main__':
     plot_per_noise()
     plot_clean_vs_noiseaug()
     plot_structural_summary()
+    plot_per_noise_clean_only()
+    plot_routing_analysis()
 
     print(f"\nDone! All figures saved to: {OUT_DIR}/")
     print(f"\nKey observations:")
@@ -575,3 +793,4 @@ if __name__ == '__main__':
     print(f"  - NanoMamba achieves 4.6x better parameter efficiency")
     print(f"  - White/Pink noise: largest gap (broadband, no spectral structure)")
     print(f"  - Babble noise: smallest gap (DualPCEN routing helps)")
+    print(f"  - Routing: Pink/Street→Expert2(stat), Babble→Expert1(nonstat)")

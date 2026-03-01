@@ -1289,14 +1289,16 @@ def _extract_dualpcen_gates(model, dualpcen, audio, device):
 
 # Calibration profiles: noise environment → optimal parameter preset
 CALIBRATION_PROFILES = {
-    'clean':    dict(delta_floor_min=0.15, delta_floor_max=0.15,
-                    epsilon_min=0.08, epsilon_max=0.08, bgate_floor=0.0),
-    'light':    dict(delta_floor_min=0.08, delta_floor_max=0.15,
-                    epsilon_min=0.08, epsilon_max=0.15, bgate_floor=0.2),
-    'moderate': dict(delta_floor_min=0.05, delta_floor_max=0.15,
-                    epsilon_min=0.10, epsilon_max=0.20, bgate_floor=0.3),
+    # 'clean' profile must match training defaults (delta_floor_min=0.05)
+    # Previous bug: delta_floor_min=0.15 caused Clean acc to drop 93.7%→82.8%
+    'clean':    dict(delta_floor_min=0.05, delta_floor_max=0.15,
+                    epsilon_min=0.08, epsilon_max=0.20, bgate_floor=0.0),
+    'light':    dict(delta_floor_min=0.05, delta_floor_max=0.15,
+                    epsilon_min=0.08, epsilon_max=0.20, bgate_floor=0.1),
+    'moderate': dict(delta_floor_min=0.04, delta_floor_max=0.15,
+                    epsilon_min=0.10, epsilon_max=0.25, bgate_floor=0.2),
     'extreme':  dict(delta_floor_min=0.02, delta_floor_max=0.15,
-                    epsilon_min=0.15, epsilon_max=0.30, bgate_floor=0.5),
+                    epsilon_min=0.15, epsilon_max=0.30, bgate_floor=0.4),
 }
 
 # SNR → profile mapping (simulates silence-period estimation)
@@ -1315,7 +1317,10 @@ def snr_to_profile(snr_db):
 @torch.no_grad()
 def run_calibrated_evaluation(models_dict, val_loader, device,
                               noise_types=None, snr_levels=None,
-                              dataset_audios=None):
+                              dataset_audios=None,
+                              use_enhancer=False, enhancer_type='spectral',
+                              gtcrn_model=None, enhancer_bypass=False,
+                              bypass_threshold=10.0, bypass_scale=0.5):
     """Evaluate with Runtime Parameter Calibration.
 
     For each SNR level, sets the optimal calibration profile BEFORE evaluation.
@@ -1361,6 +1366,12 @@ def run_calibrated_evaluation(models_dict, val_loader, device,
                     acc = evaluate_noisy(
                         model, val_loader, device, noise_type, snr,
                         dataset_audios=dataset_audios,
+                        use_enhancer=use_enhancer,
+                        enhancer_type=enhancer_type,
+                        gtcrn_model=gtcrn_model,
+                        enhancer_bypass=enhancer_bypass,
+                        bypass_threshold=bypass_threshold,
+                        bypass_scale=bypass_scale,
                         is_cnn=is_cnn, mel_fb=mel_fb)
                 results[model_name][noise_type][str(snr)] = acc
 
@@ -2105,7 +2116,13 @@ def main():
     if args.calibrate:
         calibrated_results = run_calibrated_evaluation(
             trained_models, val_loader, device,
-            noise_types=noise_types, snr_levels=snr_levels)
+            noise_types=noise_types, snr_levels=snr_levels,
+            use_enhancer=args.use_enhancer,
+            enhancer_type=args.enhancer_type,
+            gtcrn_model=gtcrn_model,
+            enhancer_bypass=args.enhancer_bypass,
+            bypass_threshold=args.bypass_threshold,
+            bypass_scale=args.bypass_scale)
 
     # ===== 5b. Reverb evaluation (if requested) =====
     reverb_results = {}
