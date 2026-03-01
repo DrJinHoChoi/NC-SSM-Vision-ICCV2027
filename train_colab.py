@@ -931,7 +931,8 @@ def evaluate_noisy(model, val_loader, device, noise_type='factory',
 def evaluate_reverb(model, val_loader, device, rt60=0.5,
                     noise_type=None, snr_db=None, dataset_audios=None,
                     use_enhancer=False, enhancer_type='spectral',
-                    gtcrn_model=None):
+                    gtcrn_model=None,
+                    is_cnn=False, mel_fb=None):
     """Evaluate under reverberant conditions with optional noise and enhancer.
 
     Processing chain: clean → reverb → [noise] → [enhancer] → model
@@ -943,6 +944,8 @@ def evaluate_reverb(model, val_loader, device, rt60=0.5,
         use_enhancer: Apply front-end enhancer
         enhancer_type: 'spectral' or 'gtcrn'
         gtcrn_model: Loaded GTCRN model
+        is_cnn: if True, model expects mel input → compute mel from reverberant audio
+        mel_fb: mel filterbank tensor (required if is_cnn=True)
     Returns:
         accuracy (float)
     """
@@ -973,7 +976,12 @@ def evaluate_reverb(model, val_loader, device, rt60=0.5,
             else:
                 reverberant = spectral_subtraction_enhance(reverberant)
 
-        logits = model(reverberant)
+        # Step 4: Model inference (CNN needs mel, SSM uses raw audio)
+        if is_cnn and mel_fb is not None:
+            reverb_mel = _compute_mel_batch(reverberant, 512, 160, mel_fb, device)
+            logits = model(reverb_mel)
+        else:
+            logits = model(reverberant)
         _, predicted = logits.max(1)
         correct += predicted.eq(labels).sum().item()
         total += labels.size(0)
@@ -1325,26 +1333,35 @@ def run_calibrated_evaluation(models_dict, val_loader, device,
     print("  Profiles: clean(20dB+), light(10-20dB), moderate(0-10dB), extreme(<0dB)")
     print("=" * 80)
 
+    # Prepare mel filterbank for CNN baselines
+    mel_fb = _create_mel_fb_tensor()
+
     results = {}
     for model_name, model in models_dict.items():
         model.eval()
+        is_cnn = _is_cnn_model(model_name)
         results[model_name] = {}
-        print(f"\n  Evaluating: {model_name}", flush=True)
+        tag = "[CNN: mel, no calibration]" if is_cnn else "[SSM: raw, calibrated]"
+        print(f"\n  Evaluating: {model_name} {tag}", flush=True)
 
         for noise_type in noise_types:
             results[model_name][noise_type] = {}
             for snr in snr_levels:
-                # [KEY] Set calibration profile based on SNR
+                # [KEY] Set calibration profile based on SNR (NanoMamba only)
                 profile = snr_to_profile(snr)
                 if hasattr(model, 'set_calibration'):
                     model.set_calibration(profile=profile)
 
                 if snr == 'clean':
-                    acc = evaluate(model, val_loader, device)
+                    if is_cnn:
+                        acc = _evaluate_cnn(model, val_loader, device)
+                    else:
+                        acc = evaluate(model, val_loader, device)
                 else:
                     acc = evaluate_noisy(
                         model, val_loader, device, noise_type, snr,
-                        dataset_audios=dataset_audios)
+                        dataset_audios=dataset_audios,
+                        is_cnn=is_cnn, mel_fb=mel_fb)
                 results[model_name][noise_type][str(snr)] = acc
 
             # Reset to default after evaluation
@@ -1355,9 +1372,10 @@ def run_calibrated_evaluation(models_dict, val_loader, device,
             zero_acc = results[model_name][noise_type].get('0', 0)
             m15_acc = results[model_name][noise_type].get('-15', 0)
             profile_m15 = snr_to_profile(-15)
+            cal_info = f"[profile: {profile_m15}]" if not is_cnn else "[no calibration]"
             print(f"    {noise_type:<10} | Clean: {clean_acc:.1f}% | "
                   f"0dB: {zero_acc:.1f}% | -15dB: {m15_acc:.1f}% "
-                  f"[profile: {profile_m15}]", flush=True)
+                  f"{cal_info}", flush=True)
 
     # Print summary tables
     for noise_type in noise_types:
@@ -1418,18 +1436,24 @@ def run_reverb_evaluation(models_dict, val_loader, device,
     print(f"  RT60 values: {rt60_list}")
     print("=" * 80)
 
+    # Prepare mel filterbank for CNN baselines
+    mel_fb = _create_mel_fb_tensor()
+
     reverb_only_results = {}
     for model_name, model in models_dict.items():
         model.eval()
+        is_cnn = _is_cnn_model(model_name)
         reverb_only_results[model_name] = {}
-        print(f"\n  Evaluating: {model_name}", flush=True)
+        tag = "[CNN: mel]" if is_cnn else "[SSM: raw]"
+        print(f"\n  Evaluating: {model_name} {tag}", flush=True)
 
         for rt60 in rt60_list:
             acc = evaluate_reverb(
                 model, val_loader, device, rt60=rt60,
                 use_enhancer=use_enhancer,
                 enhancer_type=enhancer_type,
-                gtcrn_model=gtcrn_model)
+                gtcrn_model=gtcrn_model,
+                is_cnn=is_cnn, mel_fb=mel_fb)
             reverb_only_results[model_name][str(rt60)] = acc
             print(f"    RT60={rt60:.1f}s | Acc: {acc:.1f}%", flush=True)
 
@@ -1455,8 +1479,10 @@ def run_reverb_evaluation(models_dict, val_loader, device,
     noise_reverb_results = {}
     for model_name, model in models_dict.items():
         model.eval()
+        is_cnn = _is_cnn_model(model_name)
         noise_reverb_results[model_name] = {}
-        print(f"\n  Evaluating: {model_name}", flush=True)
+        tag = "[CNN: mel]" if is_cnn else "[SSM: raw]"
+        print(f"\n  Evaluating: {model_name} {tag}", flush=True)
 
         for noise_type in noise_types_reverb:
             noise_reverb_results[model_name][noise_type] = {}
@@ -1469,7 +1495,8 @@ def run_reverb_evaluation(models_dict, val_loader, device,
                         dataset_audios=dataset_audios,
                         use_enhancer=use_enhancer,
                         enhancer_type=enhancer_type,
-                        gtcrn_model=gtcrn_model)
+                        gtcrn_model=gtcrn_model,
+                        is_cnn=is_cnn, mel_fb=mel_fb)
                     noise_reverb_results[model_name][noise_type][key] = acc
                     print(f"    {noise_type:<10} SNR={snr_db:>3}dB RT60={rt60:.1f}s | "
                           f"Acc: {acc:.1f}%", flush=True)
