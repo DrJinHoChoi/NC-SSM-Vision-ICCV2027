@@ -73,6 +73,11 @@ try:
         create_nanomamba_matched_dualpcen,
         create_nanomamba_tiny_tripcen,
         create_nanomamba_matched_tripcen,
+        # v2 Enhanced Routing variants
+        create_nanomamba_tiny_dualpcen_v2,
+        create_nanomamba_matched_dualpcen_v2,
+        create_nanomamba_tiny_tripcen_v2,
+        create_nanomamba_matched_tripcen_v2,
     )
     print("  [OK] nanomamba.py loaded successfully")
 except ImportError:
@@ -408,12 +413,19 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, device,
                 # independent noise_type × SNR
                 # → Maximizes DualPCEN routing diversity
                 # ============================================
+                # Track per-sample noise metadata (for aux routing loss)
+                noise_types_per_sample = []
+                snr_dbs_per_sample = []
+
                 for i in range(n_noisy):
                     # Random noise type per sample
                     noise_type_i = noise_types_pool[
                         np.random.randint(len(noise_types_pool))]
                     # Random SNR per sample (continuous)
                     snr_db_i = np.random.uniform(snr_range[0], snr_range[1])
+
+                    noise_types_per_sample.append(noise_type_i)
+                    snr_dbs_per_sample.append(snr_db_i)
 
                     # Generate noise for this sample
                     noise_i = generate_noise_signal(
@@ -444,6 +456,21 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, device,
                 logits = model(audio)
 
         loss = criterion(logits, labels)
+
+        # [v2] Auxiliary routing loss: explicit gate supervision
+        # During noise-aug, we KNOW noise type → soft gate targets → MSE loss
+        if (effective_noise_aug and effective_ratio > 0
+                and not is_cnn and hasattr(model, 'get_routing_gate')):
+            gate_pred = model.get_routing_gate()
+            if gate_pred is not None and n_noisy > 0:
+                gate_targets = torch.tensor(
+                    [_compute_gate_target(nt, snr)
+                     for nt, snr in zip(noise_types_per_sample, snr_dbs_per_sample)],
+                    device=device, dtype=torch.float32)
+                routing_loss = F.mse_loss(gate_pred[:n_noisy], gate_targets)
+                # Ramp up: 0 during warm-up, max 0.1
+                routing_weight = min(0.1, 0.02 * max(0, epoch - 2))
+                loss = loss + routing_weight * routing_loss
 
         optimizer.zero_grad()
         loss.backward()
@@ -992,6 +1019,39 @@ def noise_aware_bypass(original, enhanced, bypass_threshold=8.0,
     gate = torch.sigmoid(bypass_scale * (snr_est - adaptive_threshold))
 
     return gate * original + (1 - gate) * enhanced
+
+
+# ============================================================================
+# Auxiliary Routing Loss: Gate Target Computation (DualPCEN v2)
+# ============================================================================
+
+# Soft gate targets: noise type → desired gate value
+# High gate = stationary expert, low gate = non-stationary expert
+NOISE_GATE_TARGETS = {
+    'clean': 0.2,     # mostly nonstat expert (preserves speech dynamics)
+    'babble': 0.15,   # strongly nonstat (babble = non-stationary)
+    'street': 0.45,   # mixed (street has both stationary hum + transients)
+    'factory': 0.65,  # mostly stat (factory hum = stationary)
+    'pink': 0.80,     # strongly stat (broadband stationary)
+    'white': 0.90,    # very strongly stat (maximally stationary)
+}
+
+
+def _compute_gate_target(noise_type, snr_db):
+    """Compute soft gate target based on noise type and SNR.
+
+    At low SNR, noise dominates → push target toward more extreme values.
+    At high SNR, speech dominates → pull target toward center (0.5).
+
+    Returns:
+        float: target gate value in [0, 1]
+    """
+    import math
+    base = NOISE_GATE_TARGETS.get(noise_type, 0.5)
+    # snr_factor: ~0.88 at -15dB, ~0.5 at 5dB, ~0.12 at 15dB
+    snr_factor = 1.0 / (1.0 + math.exp((snr_db - 5.0) / 5.0))
+    target = 0.5 + (base - 0.5) * (0.5 + snr_factor)
+    return max(0.0, min(1.0, target))
 
 
 def mix_audio_at_snr(clean_audio, noise, snr_db):
@@ -1863,6 +1923,11 @@ MODEL_REGISTRY = {
     'NanoMamba-Matched-DualPCEN': create_nanomamba_matched_dualpcen,
     'NanoMamba-Tiny-TriPCEN': create_nanomamba_tiny_tripcen,
     'NanoMamba-Matched-TriPCEN': create_nanomamba_matched_tripcen,
+    # v2 Enhanced Routing (TMI + SNR-Conditioned, 0 extra params)
+    'NanoMamba-Tiny-DualPCEN-v2': create_nanomamba_tiny_dualpcen_v2,
+    'NanoMamba-Matched-DualPCEN-v2': create_nanomamba_matched_dualpcen_v2,
+    'NanoMamba-Tiny-TriPCEN-v2': create_nanomamba_tiny_tripcen_v2,
+    'NanoMamba-Matched-TriPCEN-v2': create_nanomamba_matched_tripcen_v2,
     'DS-CNN-S': lambda n=12: DSCNN_S(n_classes=n),
     'BC-ResNet-1': lambda n=12: BCResNet(n_classes=n, scale=1),
 }

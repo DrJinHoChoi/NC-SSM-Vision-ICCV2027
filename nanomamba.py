@@ -338,6 +338,146 @@ class DualPCEN(nn.Module):
 
 
 # ============================================================================
+# DualPCEN v2: Enhanced Routing (TMI + SNR-Conditioned + Temporal Smoothing)
+# ============================================================================
+
+class DualPCEN_v2(nn.Module):
+    """Enhanced Dual-PCEN with Temporal + SNR-Conditioned Routing.
+
+    Four improvements over DualPCEN, all at 0 extra inference parameters:
+
+    1. TMI (Temporal Modulation Index): time-domain stationarity signal.
+       SF measures frequency flatness, TMI measures temporal energy variance.
+       Stationary noise (white/factory) → low TMI, non-stationary (babble) → high TMI.
+       Orthogonal to SF: resolves ambiguous cases where spectrum shape is similar.
+
+    2. SNR-Conditioned Gate Temperature: at low SNR noise dominates and noise
+       type is clear from acoustics → sharper routing. At high SNR, speech dominates
+       and routing matters less → softer blending. Uses already-computed snr_mel.
+
+    3. Temporal Smoothing: per-frame SF is noisy at low SNR. Causal moving average
+       (K=7, ~70ms) stabilizes routing decisions. GPU-friendly via conv1d.
+
+    4. Auxiliary Routing Loss support: stores gate values for training-time
+       supervision with known noise type labels. 0 inference overhead.
+
+    Extra params vs DualPCEN: 0 (identical parameter count).
+    """
+
+    def __init__(self, n_mels=40, smooth_window=7, snr_temp_scale=2.0):
+        super().__init__()
+        self.n_mels_cfg = n_mels
+
+        # Expert 1: Non-stationary noise (babble) — high δ kills AGC
+        self.pcen_nonstat = PCEN(
+            n_mels=n_mels,
+            s_init=0.025, alpha_init=0.99,
+            delta_init=2.0, r_init=0.5,
+            delta_clamp=(0.5, 5.0))
+
+        # Expert 2: Stationary noise (factory, white, pink) — low δ enables AGC
+        self.pcen_stat = PCEN(
+            n_mels=n_mels,
+            s_init=0.15, alpha_init=0.99,
+            delta_init=0.01, r_init=0.1,
+            delta_clamp=(0.001, 0.1))
+
+        # Gate temperature (1 learnable param, same as DualPCEN)
+        self.gate_temp = nn.Parameter(torch.tensor(5.0))
+
+        # Smoothing config (0 learnable params)
+        self.smooth_window = smooth_window
+        self.snr_temp_scale = snr_temp_scale
+
+        # Pre-register smoothing kernel as buffer (avoids re-creation per forward)
+        if smooth_window > 1:
+            kernel = torch.ones(1, 1, smooth_window) / smooth_window
+            self.register_buffer('smooth_kernel', kernel)
+
+        # Storage for auxiliary routing loss (training-time only)
+        self._last_gate = None
+
+    def _causal_smooth(self, x):
+        """Causal moving average. 0 params, GPU-friendly via conv1d.
+
+        Args:
+            x: (B, 1, T) signal to smooth
+        Returns:
+            smoothed: (B, 1, T) causal-smoothed signal
+        """
+        K = self.smooth_window
+        if K <= 1:
+            return x
+        return F.conv1d(F.pad(x, (K - 1, 0)), self.smooth_kernel)
+
+    def forward(self, mel_linear, snr_mel=None):
+        """
+        Args:
+            mel_linear: (B, n_mels, T) LINEAR mel energy (before normalization)
+            snr_mel: (B, n_mels, T) per-mel-band SNR in [0,1] from SNREstimator
+        Returns:
+            pcen_out: (B, n_mels, T) noise-adaptively routed PCEN output
+        """
+        # Both experts process the same input
+        out_nonstat = self.pcen_nonstat(mel_linear)
+        out_stat = self.pcen_stat(mel_linear)
+
+        # === Spectral Flatness (0 params) ===
+        log_mel = torch.log(mel_linear + 1e-8)
+        geo_mean = torch.exp(log_mel.mean(dim=1, keepdim=True))
+        arith_mean = mel_linear.mean(dim=1, keepdim=True) + 1e-8
+        sf_raw = (geo_mean / arith_mean).clamp(0, 1)  # (B, 1, T)
+
+        # [v2] Temporal smoothing of SF (0 params)
+        sf = self._causal_smooth(sf_raw)
+
+        # === Spectral Tilt (0 params) ===
+        n_mels = mel_linear.size(1)
+        low_energy = mel_linear[:, :n_mels // 3, :].mean(dim=1, keepdim=True)
+        high_energy = mel_linear[:, 2 * n_mels // 3:, :].mean(dim=1, keepdim=True)
+        spectral_tilt = (low_energy / (low_energy + high_energy + 1e-8)).clamp(0, 1)
+
+        # SF + Tilt correction (same as DualPCEN)
+        sf_adjusted = sf + (1.0 - sf) * torch.relu(spectral_tilt - 0.6)
+
+        # === [v2] TMI: Temporal Modulation Index (0 params) ===
+        # Coefficient of variation of frame energy over causal window.
+        # Stationary noise → low TMI, non-stationary → high TMI.
+        frame_energy = mel_linear.mean(dim=1, keepdim=True)  # (B, 1, T)
+        ema_E = self._causal_smooth(frame_energy)
+        ema_E2 = self._causal_smooth(frame_energy ** 2)
+        variance = (ema_E2 - ema_E ** 2).clamp(min=0)
+        tmi = variance.sqrt() / (ema_E + 1e-8)  # CV coefficient
+        tmi = self._causal_smooth(tmi.clamp(0, 2.0) / 2.0)  # normalize to [0,1]
+
+        # TMI correction: low TMI (temporally stationary) → boost toward stat expert
+        tmi_boost = torch.relu(0.5 - tmi) * 0.5
+        routing_signal = sf_adjusted + (1.0 - sf_adjusted) * tmi_boost
+
+        # === [v2] SNR-conditioned temperature (0 params) ===
+        # Low SNR → noise dominates → noise type is acoustically clear → sharper gate
+        # High SNR → speech dominates → routing less critical → softer blending
+        if snr_mel is not None:
+            # snr_mel: tanh(snr/10) ∈ [0,1], 0=noise-dominated, 1=clean
+            snr_global = snr_mel.mean(dim=(1, 2)).unsqueeze(-1).unsqueeze(-1)
+            snr_scale = 1.0 + self.snr_temp_scale * (1.0 - snr_global)
+            effective_temp = self.gate_temp * snr_scale
+        else:
+            effective_temp = self.gate_temp
+
+        # Gate computation
+        gate = torch.sigmoid(effective_temp * (routing_signal - 0.5))
+
+        # Weighted blend
+        pcen_out = gate * out_stat + (1 - gate) * out_nonstat
+
+        # Store gate for auxiliary routing loss (training-time only)
+        self._last_gate = gate.mean(dim=(1, 2))  # (B,)
+
+        return pcen_out
+
+
+# ============================================================================
 # Multi-PCEN: N-Expert PCEN with Hierarchical Routing
 # ============================================================================
 
@@ -442,6 +582,116 @@ class MultiPCEN(nn.Module):
             w_nonstat = 1 - p_stat                  # Expert 0 (babble)
             w_broad = p_stat * p_broad              # Expert 1 (white/pink)
             w_colored = p_stat * (1 - p_broad)      # Expert 2 (factory/street)
+
+            pcen_out = (w_nonstat * outputs[0] +
+                        w_broad * outputs[1] +
+                        w_colored * outputs[2])
+
+        return pcen_out
+
+
+# ============================================================================
+# MultiPCEN v2: Enhanced N-Expert Routing (TMI + SNR-Conditioned)
+# ============================================================================
+
+class MultiPCEN_v2(nn.Module):
+    """Enhanced N-Expert PCEN with TMI + SNR-Conditioned Hierarchical Routing.
+
+    Same improvements as DualPCEN_v2, applied to both routing levels:
+    1. TMI (Temporal Modulation Index) for time-domain stationarity
+    2. SNR-conditioned gate temperatures (sharper at low SNR)
+    3. Temporal smoothing of SF and TMI signals
+    4. Auxiliary routing loss support (_last_gate_l1, _last_gate_l2)
+
+    Extra params vs MultiPCEN: 0 (identical parameter count).
+    """
+
+    EXPERT_CONFIGS = MultiPCEN.EXPERT_CONFIGS  # reuse same configs
+
+    def __init__(self, n_mels=40, n_experts=3, smooth_window=7,
+                 snr_temp_scale=2.0):
+        super().__init__()
+        self.n_experts = n_experts
+        self.n_mels_cfg = n_mels
+
+        configs = self.EXPERT_CONFIGS[:n_experts]
+        self.experts = nn.ModuleList([
+            PCEN(n_mels=n_mels, **cfg) for cfg in configs
+        ])
+
+        self.gate_temp = nn.Parameter(torch.tensor(5.0))
+        if n_experts >= 3:
+            self.gate_temp2 = nn.Parameter(torch.tensor(5.0))
+
+        self.smooth_window = smooth_window
+        self.snr_temp_scale = snr_temp_scale
+
+        if smooth_window > 1:
+            kernel = torch.ones(1, 1, smooth_window) / smooth_window
+            self.register_buffer('smooth_kernel', kernel)
+
+        self._last_gate_l1 = None
+        self._last_gate_l2 = None
+
+    def _causal_smooth(self, x):
+        K = self.smooth_window
+        if K <= 1:
+            return x
+        return F.conv1d(F.pad(x, (K - 1, 0)), self.smooth_kernel)
+
+    def forward(self, mel_linear, snr_mel=None):
+        outputs = [expert(mel_linear) for expert in self.experts]
+
+        # Spectral Flatness + temporal smoothing
+        log_mel = torch.log(mel_linear + 1e-8)
+        geo_mean = torch.exp(log_mel.mean(dim=1, keepdim=True))
+        arith_mean = mel_linear.mean(dim=1, keepdim=True) + 1e-8
+        sf_raw = (geo_mean / arith_mean).clamp(0, 1)
+        sf = self._causal_smooth(sf_raw)
+
+        # Spectral Tilt
+        n_mels = mel_linear.size(1)
+        low_energy = mel_linear[:, :n_mels // 3, :].mean(dim=1, keepdim=True)
+        high_energy = mel_linear[:, 2 * n_mels // 3:, :].mean(dim=1, keepdim=True)
+        spectral_tilt = (low_energy / (low_energy + high_energy + 1e-8)).clamp(0, 1)
+
+        sf_adjusted = sf + (1.0 - sf) * torch.relu(spectral_tilt - 0.6)
+
+        # [v2] TMI: Temporal Modulation Index
+        frame_energy = mel_linear.mean(dim=1, keepdim=True)
+        ema_E = self._causal_smooth(frame_energy)
+        ema_E2 = self._causal_smooth(frame_energy ** 2)
+        variance = (ema_E2 - ema_E ** 2).clamp(min=0)
+        tmi = variance.sqrt() / (ema_E + 1e-8)
+        tmi = self._causal_smooth(tmi.clamp(0, 2.0) / 2.0)
+
+        tmi_boost = torch.relu(0.5 - tmi) * 0.5
+        routing_signal = sf_adjusted + (1.0 - sf_adjusted) * tmi_boost
+
+        # [v2] SNR-conditioned temperatures
+        if snr_mel is not None:
+            snr_global = snr_mel.mean(dim=(1, 2)).unsqueeze(-1).unsqueeze(-1)
+            snr_scale = 1.0 + self.snr_temp_scale * (1.0 - snr_global)
+        else:
+            snr_scale = 1.0
+
+        # Level 1: Stationary vs Non-stationary
+        eff_temp1 = self.gate_temp * snr_scale
+        p_stat = torch.sigmoid(eff_temp1 * (routing_signal - 0.5))
+        self._last_gate_l1 = p_stat.mean(dim=(1, 2))
+
+        if self.n_experts == 2:
+            pcen_out = p_stat * outputs[1] + (1 - p_stat) * outputs[0]
+        elif self.n_experts >= 3:
+            # Level 2: Broadband vs Colored (within stationary)
+            # Use smoothed raw SF (not TMI-adjusted) for sub-stationary routing
+            eff_temp2 = self.gate_temp2 * snr_scale
+            p_broad = torch.sigmoid(eff_temp2 * (sf - 0.7))
+            self._last_gate_l2 = p_broad.mean(dim=(1, 2))
+
+            w_nonstat = 1 - p_stat
+            w_broad = p_stat * p_broad
+            w_colored = p_stat * (1 - p_broad)
 
             pcen_out = (w_nonstat * outputs[0] +
                         w_broad * outputs[1] +
@@ -977,6 +1227,7 @@ class NanoMamba(nn.Module):
                  use_tiny_conv=False, tiny_conv_ks=3,
                  use_pcen=False, use_dual_pcen=False,
                  use_multi_pcen=False, n_pcen_experts=3,
+                 use_dual_pcen_v2=False, use_multi_pcen_v2=False,
                  weight_sharing=False, n_repeats=3):
         """
         Args:
@@ -1015,6 +1266,11 @@ class NanoMamba(nn.Module):
                 Overrides use_dual_pcen and use_pcen if True.
             n_pcen_experts: number of PCEN experts (2=DualPCEN, 3=TriPCEN).
                 Only used when use_multi_pcen=True. Default 3.
+            use_dual_pcen_v2: if True, use DualPCEN_v2 with enhanced routing:
+                TMI + SNR-conditioned temp + temporal smoothing + aux loss.
+                0 extra params vs DualPCEN. Overrides use_dual_pcen.
+            use_multi_pcen_v2: if True, use MultiPCEN_v2 with enhanced routing.
+                0 extra params vs MultiPCEN. Overrides use_multi_pcen.
             weight_sharing: if True, use a single SA-SSM block repeated
                 n_repeats times (depth of n_repeats, params of 1 block).
             n_repeats: number of times to repeat the shared block.
@@ -1033,8 +1289,10 @@ class NanoMamba(nn.Module):
         self.use_moe_freq = use_moe_freq
         self.use_tiny_conv = use_tiny_conv
         self.use_pcen = use_pcen
-        self.use_dual_pcen = use_dual_pcen
-        self.use_multi_pcen = use_multi_pcen
+        self.use_dual_pcen = use_dual_pcen or use_dual_pcen_v2
+        self.use_dual_pcen_v2 = use_dual_pcen_v2
+        self.use_multi_pcen = use_multi_pcen or use_multi_pcen_v2
+        self.use_multi_pcen_v2 = use_multi_pcen_v2
 
         # 0. Frequency processing plug-in (optional, mutually exclusive)
         if use_freq_filter:
@@ -1049,9 +1307,17 @@ class NanoMamba(nn.Module):
             self.tiny_conv = TinyConv2D(kernel_size=tiny_conv_ks)
 
         # 0c. Feature normalization front-end
-        if use_multi_pcen:
+        if use_multi_pcen_v2:
+            # MultiPCEN_v2: TMI + SNR-conditioned hierarchical routing
+            self.multi_pcen = MultiPCEN_v2(n_mels=n_mels, n_experts=n_pcen_experts)
+            self.freq_dep_floor = FrequencyDependentFloor(n_mels=n_mels)
+        elif use_multi_pcen:
             # MultiPCEN: N-expert PCEN with hierarchical routing
             self.multi_pcen = MultiPCEN(n_mels=n_mels, n_experts=n_pcen_experts)
+            self.freq_dep_floor = FrequencyDependentFloor(n_mels=n_mels)
+        elif use_dual_pcen_v2:
+            # DualPCEN_v2: TMI + SNR-conditioned routing — enhanced
+            self.dual_pcen = DualPCEN_v2(n_mels=n_mels)
             self.freq_dep_floor = FrequencyDependentFloor(n_mels=n_mels)
         elif use_dual_pcen:
             # DualPCEN: noise-adaptive routing — ALL noise types
@@ -1064,7 +1330,7 @@ class NanoMamba(nn.Module):
 
         # 1. SNR Estimator (with running EMA when PCEN/DualPCEN/MultiPCEN is enabled)
         self.snr_estimator = SNREstimator(
-            n_freq=n_freq, use_running_ema=(use_pcen or use_dual_pcen or use_multi_pcen))
+            n_freq=n_freq, use_running_ema=(use_pcen or self.use_dual_pcen or self.use_multi_pcen))
 
         # 2. Mel filterbank (fixed)
         mel_fb = self._create_mel_fb(sr, n_fft, n_mels)
@@ -1171,12 +1437,19 @@ class NanoMamba(nn.Module):
             mel = self.tiny_conv(mel)
 
         # Feature normalization: MultiPCEN / DualPCEN / PCEN / log
+        # v2 variants receive snr_mel for SNR-conditioned routing
         if self.use_multi_pcen:
-            mel = self.freq_dep_floor(mel)   # Low-freq safety net
-            mel = self.multi_pcen(mel)       # N-expert hierarchical routing
+            mel = self.freq_dep_floor(mel)
+            if self.use_multi_pcen_v2:
+                mel = self.multi_pcen(mel, snr_mel=snr_mel)
+            else:
+                mel = self.multi_pcen(mel)
         elif self.use_dual_pcen:
-            mel = self.freq_dep_floor(mel)   # Low-freq safety net
-            mel = self.dual_pcen(mel)        # Noise-adaptive dual expert routing
+            mel = self.freq_dep_floor(mel)
+            if self.use_dual_pcen_v2:
+                mel = self.dual_pcen(mel, snr_mel=snr_mel)
+            else:
+                mel = self.dual_pcen(mel)
         elif self.use_pcen:
             mel = self.freq_dep_floor(mel)   # Low-freq safety net
             mel = self.pcen(mel)             # Single PCEN (factory specialist)
@@ -1186,6 +1459,18 @@ class NanoMamba(nn.Module):
         mel = self.input_norm(mel)
 
         return mel, snr_mel
+
+    def get_routing_gate(self):
+        """Return last routing gate values for auxiliary loss (training-time).
+
+        Returns:
+            gate: (B,) mean gate values from last forward pass, or None.
+        """
+        if self.use_dual_pcen_v2 and hasattr(self.dual_pcen, '_last_gate'):
+            return self.dual_pcen._last_gate
+        if self.use_multi_pcen_v2 and hasattr(self.multi_pcen, '_last_gate_l1'):
+            return self.multi_pcen._last_gate_l1
+        return None
 
     def forward(self, audio):
         """
@@ -1545,6 +1830,53 @@ def create_nanomamba_matched_tripcen(n_classes=12):
         n_mels=40, n_classes=n_classes,
         d_model=20, d_state=6, d_conv=3, expand=1.5,
         n_layers=2, use_multi_pcen=True, n_pcen_experts=3)
+
+
+# ============================================================================
+# v2 Enhanced Routing Variants (TMI + SNR-Conditioned, 0 extra params)
+# ============================================================================
+
+def create_nanomamba_tiny_dualpcen_v2(n_classes=12):
+    """NanoMamba-Tiny-DualPCEN-v2: Enhanced routing, same 4,957 params.
+
+    v2 improvements (0 extra params):
+      1. TMI (Temporal Modulation Index) for time-domain stationarity
+      2. SNR-conditioned gate temperature (sharper at low SNR)
+      3. Temporal smoothing of SF (stable routing at low SNR)
+      4. Auxiliary routing loss support (training-time only)
+    """
+    return NanoMamba(
+        n_mels=40, n_classes=n_classes,
+        d_model=16, d_state=4, d_conv=3, expand=1.5,
+        n_layers=2, use_dual_pcen_v2=True)
+
+
+def create_nanomamba_matched_dualpcen_v2(n_classes=12):
+    """NanoMamba-Matched-DualPCEN-v2: Enhanced routing, same 7,402 params.
+
+    Param-matched to BC-ResNet-1 (7,464). v2 routing improvements:
+      TMI + SNR-conditioned temp + SF smoothing + aux routing loss.
+    """
+    return NanoMamba(
+        n_mels=40, n_classes=n_classes,
+        d_model=21, d_state=5, d_conv=3, expand=1.5,
+        n_layers=2, use_dual_pcen_v2=True)
+
+
+def create_nanomamba_tiny_tripcen_v2(n_classes=12):
+    """NanoMamba-Tiny-TriPCEN-v2: 3-expert + enhanced routing, same params."""
+    return NanoMamba(
+        n_mels=40, n_classes=n_classes,
+        d_model=16, d_state=4, d_conv=3, expand=1.5,
+        n_layers=2, use_multi_pcen_v2=True, n_pcen_experts=3)
+
+
+def create_nanomamba_matched_tripcen_v2(n_classes=12):
+    """NanoMamba-Matched-TriPCEN-v2: 3-expert + enhanced routing, same 7,414 params."""
+    return NanoMamba(
+        n_mels=40, n_classes=n_classes,
+        d_model=20, d_state=6, d_conv=3, expand=1.5,
+        n_layers=2, use_multi_pcen_v2=True, n_pcen_experts=3)
 
 
 # ============================================================================
