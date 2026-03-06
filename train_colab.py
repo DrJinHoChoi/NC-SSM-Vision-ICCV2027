@@ -103,6 +103,7 @@ try:
         create_nanomamba_v3_deep,
         # NanoApple: Frequency-Aware SSM (CNN freq processing + SSM streaming)
         create_nanoapple,
+        create_nanoapple_v2,
     )
     print("  [OK] nanomamba.py loaded successfully")
 except ImportError:
@@ -387,6 +388,7 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, device,
                     dataset_audios=None, mel_fb=None,
                     n_fft=512, hop_length=160, n_mels=40,
                     total_epochs=30, noise_curriculum_v2=False,
+                    ss_train=False,
                     ema=None):
     """Train one epoch with Per-Sample Multi-Condition Noise Augmentation.
 
@@ -553,6 +555,15 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, device,
                     clean_i = audio[i:i+1]  # (1, T)
                     noisy_i = mix_audio_at_snr(clean_i, noise_i, snr_db_i)
                     noisy_audio[i] = noisy_i.squeeze(0)
+
+                # [SS-Train] Apply Spectral Subtraction to noisy audio
+                # during training so model learns to exploit SS-enhanced input.
+                # Key insight: SS helps NanoMamba (+20%p broadband) but
+                # hurts BC-ResNet-1 (-7%p) → asymmetric advantage.
+                if ss_train:
+                    with torch.no_grad():
+                        noisy_audio[:n_noisy] = spectral_subtraction_v2(
+                            noisy_audio[:n_noisy])
 
                 if is_cnn:
                     noisy_mel = _compute_mel_batch(
@@ -2197,6 +2208,7 @@ MODEL_REGISTRY = {
     'NanoMamba-v3-Deep': create_nanomamba_v3_deep,
     # NanoApple: Frequency-Aware SSM (CNN freq processing + SSM streaming)
     'NanoApple': create_nanoapple,
+    'NanoApple-v2': create_nanoapple_v2,
     'DS-CNN-S': lambda n=12: DSCNN_S(n_classes=n),
     'BC-ResNet-1': lambda n=12: BCResNet(n_classes=n, scale=1),
 }
@@ -2260,6 +2272,7 @@ def _adjust_bn_momentum(model, momentum):
 def train_model(model, model_name, train_dataset, val_dataset,
                 checkpoint_dir, device, epochs=30, batch_size=128, lr=3e-3,
                 noise_aug=False, noise_ratio=0.5, noise_curriculum_v2=False,
+                ss_train=False,
                 use_ema=False, ema_decay=0.999):
     """Full training loop with Per-Sample Multi-Condition Noise Augmentation.
 
@@ -2368,6 +2381,7 @@ def train_model(model, model_name, train_dataset, val_dataset,
             is_cnn=is_cnn, dataset_audios=dataset_audios,
             mel_fb=mel_fb, total_epochs=epochs,
             noise_curriculum_v2=noise_curriculum_v2,
+            ss_train=ss_train,
             ema=ema)
 
         # Evaluate on CLEAN val set (always clean, fair comparison)
@@ -2521,6 +2535,11 @@ def main():
                         help='Use v2 noise curriculum: type-staged introduction '
                              '(stationary first, then non-stationary) + '
                              'SNR annealing (Gaussian centered at difficulty frontier)')
+    parser.add_argument('--ss_train', action='store_true',
+                        help='Apply Spectral Subtraction (SS v2) to noisy audio '
+                             'DURING training. Model learns to exploit SS-enhanced '
+                             'input. NanoMamba gains +20%%p broadband robustness '
+                             'while BC-ResNet-1 loses -7%%p (asymmetric advantage).')
     parser.add_argument('--calibrate_continuous', action='store_true',
                         help='Use continuous calibration interpolation instead of '
                              'discrete 4-profile system. Smooth SNR-to-parameter curves.')
@@ -2613,6 +2632,7 @@ def main():
                 epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
                 noise_aug=args.noise_aug, noise_ratio=args.noise_ratio,
                 noise_curriculum_v2=args.noise_curriculum_v2,
+                ss_train=args.ss_train,
                 use_ema=args.use_ema, ema_decay=args.ema_decay)
 
         trained_models[model_name] = model

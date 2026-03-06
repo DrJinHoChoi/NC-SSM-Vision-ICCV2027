@@ -1701,6 +1701,147 @@ class SubBandNormBroadcast(nn.Module):
         return x_sub.reshape(B, T, D) + broadcast + residual
 
 
+class SubBandSSMBlock(nn.Module):
+    """Sub-band Parallel SSM: processes each sub-band independently.
+
+    Key insight: BC-ResNet-1 wins because it maintains per-sub-band processing
+    throughout all 7 blocks. Standard SSM mixes all d_model dims into a flat
+    vector, destroying sub-band identity.
+
+    SubBandSSMBlock processes each sub-band's temporal sequence independently,
+    then applies cross-band broadcast for inter-sub-band communication.
+
+    Architecture per sub-band (d_sub dims each):
+      1. LayerNorm(d_sub)
+      2. Linear(d_sub → d_inner_sub)  [in_proj: gate + x]
+      3. Causal Conv1d(d_inner_sub//2)
+      4. Simplified SSM scan (A, dt, B, C per sub-band)
+      5. Linear(d_inner_sub//2 → d_sub)  [out_proj]
+    Then: cross-band broadcast + residual
+
+    This maintains frequency structure INSIDE the SSM blocks,
+    analogous to BC-ResNet's SSN at every layer.
+    """
+
+    def __init__(self, d_model=20, n_sub_bands=5, d_state=4,
+                 d_conv=3, expand=1.5, n_mels=40):
+        super().__init__()
+        self.n_sub_bands = n_sub_bands
+        self.d_sub = d_model // n_sub_bands  # 4
+        d_inner = int(self.d_sub * expand)  # 6
+
+        # Per-sub-band: shared-weight SSM (weight sharing across sub-bands)
+        # This is parameter-efficient: one set of SSM weights serves all 5 sub-bands
+        self.norm = nn.LayerNorm(self.d_sub)
+        self.in_proj = nn.Linear(self.d_sub, d_inner * 2, bias=False)  # gate + x
+        self.conv1d = nn.Conv1d(d_inner, d_inner, d_conv,
+                                padding=d_conv - 1, groups=d_inner)  # causal
+
+        # SSM parameters (shared across sub-bands)
+        self.A_log = nn.Parameter(torch.log(
+            torch.arange(1, d_state + 1).float().unsqueeze(0).expand(d_inner, -1)))
+        self.D = nn.Parameter(torch.ones(d_inner))
+        self.dt_proj = nn.Linear(1, d_inner, bias=True)
+        self.x_proj = nn.Linear(d_inner, d_state * 2 + 1, bias=False)  # dt, B, C
+        self.out_proj = nn.Linear(d_inner, self.d_sub, bias=False)
+
+        # Cross-band broadcast
+        self.broadcast_proj = nn.Linear(self.d_sub, d_model, bias=False)
+
+        # SNR projection (shared, from full n_mels)
+        self.snr_proj = nn.Linear(n_mels, d_state + 1, bias=True)
+
+        self.d_inner = d_inner
+        self.d_state = d_state
+        self.d_conv = d_conv
+
+    def _ssm_scan(self, x, A, dt, B, C, D):
+        """Simplified parallel SSM scan."""
+        B_batch, T, d_inner = x.shape
+        d_state = A.shape[1]
+
+        # Discretize
+        dtA = torch.einsum('btd,dn->btdn', dt, A)
+        dA = torch.exp(dtA)
+        dB = torch.einsum('btd,btn->btdn', dt, B)
+
+        # Sequential scan
+        h = torch.zeros(B_batch, d_inner, d_state, device=x.device)
+        ys = []
+        for t in range(T):
+            h = dA[:, t] * h + dB[:, t] * x[:, t].unsqueeze(-1)
+            y_t = torch.einsum('bdn,bn->bd', h, C[:, t])
+            ys.append(y_t)
+        y = torch.stack(ys, dim=1)  # (B, T, d_inner)
+
+        return y + x * D
+
+    def forward(self, x, snr, pcen_gate=None):
+        """
+        Args:
+            x: (B, T, d_model)   - SSM latent
+            snr: (B, T, n_mels)  - per-mel-band SNR
+        Returns:
+            (B, T, d_model)
+        """
+        B, T, D = x.shape
+        residual = x
+
+        # SNR → shared modulation
+        snr_mean = snr.mean(dim=1, keepdim=True)  # (B, 1, n_mels)
+        snr_feat = self.snr_proj(snr_mean).expand(B, T, -1)  # (B, T, d_state+1)
+
+        # Split into sub-bands: (B, T, 5, 4)
+        x_sub = x.view(B, T, self.n_sub_bands, self.d_sub)
+
+        # Process each sub-band with shared-weight SSM
+        out_subs = []
+        A = -torch.exp(self.A_log)
+
+        for s in range(self.n_sub_bands):
+            xs = self.norm(x_sub[:, :, s, :])  # (B, T, d_sub)
+
+            # In-projection: gate + features
+            xz = self.in_proj(xs)  # (B, T, 2*d_inner)
+            x_feat, z = xz.chunk(2, dim=-1)  # each (B, T, d_inner)
+
+            # Causal conv1d
+            x_conv = x_feat.transpose(1, 2)  # (B, d_inner, T)
+            x_conv = self.conv1d(x_conv)[:, :, :T]
+            x_feat = F.silu(x_conv.transpose(1, 2))
+
+            # SSM projections
+            x_dbc = self.x_proj(x_feat)  # (B, T, 2*d_state+1)
+            dt_raw = x_dbc[:, :, :1]  # (B, T, 1)
+            bc_raw = x_dbc[:, :, 1:]  # (B, T, 2*d_state)
+
+            # SNR modulation on dt
+            dt_snr = snr_feat[:, :, :1]  # (B, T, 1)
+            dt = F.softplus(self.dt_proj(dt_raw + dt_snr * 0.1))
+
+            # B, C from combined projections + SNR
+            B_param = bc_raw[:, :, :self.d_state] + snr_feat[:, :, 1:] * 0.1
+            C_param = bc_raw[:, :, self.d_state:]
+
+            # SSM scan
+            y = self._ssm_scan(x_feat, A, dt, B_param, C_param, self.D)
+
+            # Gated output
+            y = y * F.silu(z)
+            y = self.out_proj(y)  # (B, T, d_sub)
+            out_subs.append(y)
+
+        # Concatenate sub-bands
+        out = torch.stack(out_subs, dim=2)  # (B, T, 5, d_sub)
+
+        # Cross-band broadcast
+        out_avg = out.mean(dim=2)  # (B, T, d_sub)
+        broadcast = self.broadcast_proj(out_avg)  # (B, T, d_model)
+
+        out = out.reshape(B, T, D) + broadcast + residual
+        return out
+
+
 # ============================================================================
 # Frequency-Interleaved Mamba (FI-Mamba)
 # ============================================================================
@@ -2426,6 +2567,7 @@ class NanoMamba(nn.Module):
                  use_spectral_block=False, d_state_f=3,
                  use_spec_augment=False,
                  use_freq_aware=False, n_sub_bands=5, d_sub=4,
+                 use_subband_ssm=False,
                  weight_sharing=False, n_repeats=3):
         """
         Args:
@@ -2512,6 +2654,7 @@ class NanoMamba(nn.Module):
         self.use_freq_aware = use_freq_aware
         self.n_sub_bands = n_sub_bands
         self.d_sub = d_sub
+        self.use_subband_ssm = use_subband_ssm
 
         # Mutual exclusion: waveform-domain vs magnitude-domain enhancer
         assert not (use_spectral_enhancer and use_learnable_enhancer), \
@@ -2633,6 +2776,13 @@ class NanoMamba(nn.Module):
                 SubBandNormBroadcast(d_model=d_model, n_sub_bands=n_sub_bands)
                 for _ in range(n_layers)
             ])
+
+        # 5c. [SB-SSM] Sub-band Parallel SSM: per-sub-band independent processing
+        if use_subband_ssm:
+            self.subband_block = SubBandSSMBlock(
+                d_model=d_model, n_sub_bands=n_sub_bands,
+                d_state=d_state, d_conv=d_conv, expand=expand,
+                n_mels=n_mels)
 
         # 6. Final norm
         self.final_norm = nn.LayerNorm(d_model)
@@ -2853,6 +3003,11 @@ class NanoMamba(nn.Module):
                 x = block(x, snr, pcen_gate=pcen_gate)
                 if self.use_freq_aware:
                     x = self.sub_band_norms[i](x)
+
+        # [SB-SSM] Sub-band Parallel SSM: per-sub-band independent processing
+        # Applied after full-mixing SSM blocks to re-establish frequency structure
+        if self.use_subband_ssm:
+            x = self.subband_block(x, snr, pcen_gate=pcen_gate)
 
         # Final norm + global average pooling
         x = self.final_norm(x)  # (B, T, d_model)
@@ -3754,6 +3909,30 @@ def create_nanoapple(n_classes=12):
         use_freq_aware=True, n_sub_bands=5, d_sub=4)
 
 
+def create_nanoapple_v2(n_classes=12):
+    """NanoApple-v2: Sub-band Parallel SSM for noise-robust KWS.
+
+    Extends NanoApple with SubBandSSMBlock: processes each frequency
+    sub-band independently through a shared-weight SSM, then applies
+    cross-band broadcast. This maintains frequency structure INSIDE
+    the SSM processing, analogous to BC-ResNet's per-sub-band SSN.
+
+    Architecture:
+      DualPCEN → FreqConvBlock → GroupedProj(5×8→4) → SM-SSM Block
+      → SubBandNormBroadcast → SubBandSSMBlock → GAP → Classifier
+
+    Uses 2 SM-SSM blocks (d_state=4) + 1 SubBandSSMBlock,
+    fitting within BC-ResNet-1's 7,464 param budget.
+    """
+    return NanoMamba(
+        n_mels=40, n_classes=n_classes,
+        d_model=20, d_state=4, d_conv=3, expand=1.5,
+        n_layers=2, use_dual_pcen_v2=True,
+        use_ssm_v2=True, use_sm_ssm=True,
+        use_freq_aware=True, n_sub_bands=5, d_sub=4,
+        use_subband_ssm=True)
+
+
 def create_nanomamba_v3_matched(n_classes=12):
     """NanoMamba-v3-Matched: 2 unique layers, d=27, N=5.
 
@@ -3811,6 +3990,7 @@ if __name__ == '__main__':
         'NanoMamba-Tiny-SM': create_nanomamba_tiny_dualpcen_v2_smssm,
         # NanoApple: Frequency-Aware SSM (CNN freq processing + SSM streaming)
         'NanoApple': create_nanoapple,
+        'NanoApple-v2': create_nanoapple_v2,
         # v3: Pure representation efficiency — beat BC-ResNet-1
         'NanoMamba-v3-Matched': create_nanomamba_v3_matched,
         'NanoMamba-v3-Deep': create_nanomamba_v3_deep,
