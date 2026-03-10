@@ -1379,10 +1379,10 @@ class SelectivityModulatedSSM(SpectralAwareSSM_v2):
         super().__init__(d_inner, d_state, n_mels, mode)
 
         # Fixed (LTI) dynamics: learned "CNN-like" fallback
-        # Initialized to zero → initial behavior identical to SA-SSM v2
+        # Small init (not zero) for gradient stability; near-zero ≈ SA-SSM v2
         self.dt_base = nn.Parameter(torch.zeros(1))
-        self.B_base = nn.Parameter(torch.zeros(d_state))
-        self.C_base = nn.Parameter(torch.zeros(d_state))
+        self.B_base = nn.Parameter(torch.full((d_state,), 1e-3))
+        self.C_base = nn.Parameter(torch.full((d_state,), 1e-3))
 
         # Selectivity gate: controls selective↔fixed interpolation
         # sel_scale=5.0: moderately sharp transition
@@ -1483,7 +1483,7 @@ class SelectivityModulatedSSM(SpectralAwareSSM_v2):
 
         delta = F.softplus(
             self.dt_proj(dt_raw + dt_snr_shift)
-        ) + adaptive_floor
+        ).clamp(max=1.0) + adaptive_floor  # clamp softplus to prevent delta explosion
 
         # SNR-gated B
         if self.mode != 'standard':
@@ -1633,9 +1633,12 @@ class NoiseCondSMSSM(SelectivityModulatedSSM):
         # ★ NC-3: Spectral-flatness-conditioned B_base
         # broadband_score ≈ 1 for white noise (uniform SNR), ≈ 0 for factory
         snr_sub_mean = snr_smooth_bc.mean(dim=-1, keepdim=True)  # (B, L, 1)
-        snr_sub_std = snr_smooth_bc.std(dim=-1, keepdim=True)    # (B, L, 1)
-        spectral_var = (snr_sub_std / (snr_sub_mean + 1e-6)).clamp(0, 1)
-        broadband_score = 1.0 - spectral_var  # (B, L, 1)
+        # FIX: torch.std backward divides by std → NaN when std≈0 (clean audio)
+        # Use variance + epsilon + sqrt for gradient-safe computation
+        snr_sub_var = (snr_smooth_bc - snr_sub_mean).pow(2).mean(dim=-1, keepdim=True)
+        snr_sub_std = (snr_sub_var + 1e-6).sqrt()               # (B, L, 1)
+        spectral_var = (snr_sub_std / (snr_sub_mean.abs() + 1e-4)).clamp(0, 1)
+        broadband_score = (1.0 - spectral_var).detach()  # conditioning signal, no grad needed
 
         B_base_mod = self.B_base * (
             1.0 + self.B_sf_scale * broadband_score)  # (B, L, N) via broadcast
@@ -1673,12 +1676,12 @@ class NoiseCondSMSSM(SelectivityModulatedSSM):
 
             # ★ NC-2: Stationarity-conditioned Δ floor
             # pcen_gate high → stationary noise → boost floor (longer memory)
-            station_boost = 1.0 + self.dt_station_alpha * pg
+            station_boost = 1.0 + self.dt_station_alpha.clamp(-1.0, 1.0) * pg
             adaptive_floor = adaptive_floor * gate_modulation * station_boost
 
         delta = F.softplus(
             self.dt_proj(dt_raw + dt_snr_shift)
-        ) + adaptive_floor
+        ).clamp(max=1.0) + adaptive_floor  # clamp softplus to prevent delta explosion
 
         # SNR-gated B
         if self.mode != 'standard':
