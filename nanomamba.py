@@ -80,6 +80,8 @@ class SNREstimator(nn.Module):
         """
         # Phase 1: Initial estimate from first N frames
         init_noise = mag[:, :, :self.noise_frames].mean(dim=2, keepdim=True)
+        # Prevent noise floor collapse for silence → root cause of NaN cascade
+        init_noise = init_noise.clamp(min=1e-5)
 
         if self.use_running_ema:
             # Phase 2: Running EMA noise floor tracking
@@ -117,6 +119,8 @@ class SNREstimator(nn.Module):
 
         # Normalize to [0, 1] range with soft saturation
         snr_mel = torch.tanh(snr_mel / 10.0)
+        # Guarantee clean [0,1] output — catch any residual Inf/NaN
+        snr_mel = torch.nan_to_num(snr_mel, nan=0.0, posinf=1.0, neginf=0.0)
 
         return snr_mel
 
@@ -267,6 +271,8 @@ class PCEN(nn.Module):
         # NaN safety: clamp gain to prevent overflow in mel * gain
         gain = gain.clamp(max=1e5)
         pcen_out = (mel * gain + delta) ** r - delta ** r
+        # Defense-in-depth: catch NaN from fractional power with NaN r (upstream propagation)
+        pcen_out = torch.nan_to_num(pcen_out, nan=0.0)
 
         return pcen_out
 
@@ -482,7 +488,7 @@ class DualPCEN_v2(nn.Module):
         ema_E = self._causal_smooth(frame_energy)
         ema_E2 = self._causal_smooth(frame_energy ** 2)
         variance = (ema_E2 - ema_E ** 2).clamp(min=0)
-        tmi = variance.sqrt() / (ema_E + 1e-8)  # CV coefficient
+        tmi = variance.sqrt() / (ema_E.clamp(min=1e-5) + 1e-8)  # CV coefficient; clamp prevents Inf for silence
         tmi = self._causal_smooth(tmi.clamp(0, 2.0) / 2.0)  # normalize to [0,1]
 
         # TMI correction: low TMI (temporally stationary) → boost toward stat expert
@@ -506,14 +512,16 @@ class DualPCEN_v2(nn.Module):
         # Weighted blend
         pcen_out = gate * out_stat + (1 - gate) * out_nonstat
 
+        # NaN safety: clean outputs BEFORE storing gate for downstream consumers
+        pcen_out = torch.nan_to_num(pcen_out, nan=0.0)
+        gate = torch.nan_to_num(gate, nan=0.5)  # 0.5 = neutral blend for NaN frames
+
         # Store gate for auxiliary routing loss (training-time only)
         self._last_gate = gate.mean(dim=(1, 2))  # (B,) for aux loss
         # Store per-frame gate for SA-SSM v2 per-timestep conditioning
         # gate: (B, 1, T) → (B, T) for indexing inside SSM scan loop
         self._last_gate_per_frame = gate.squeeze(1)  # (B, T)
 
-        # NaN safety: ensure pcen_out has no NaN (can propagate from gain explosion)
-        pcen_out = torch.nan_to_num(pcen_out, nan=0.0)
         return pcen_out
 
 
@@ -1292,7 +1300,8 @@ class SpectralAwareSSM_v2(nn.Module):
         # At -15dB: tanh compresses to ~0.006 → all adaptive params collapse
         # Re-normalize: s/(s+K) with K=0.05 spreads low values without
         # affecting high values. Only used for floor/eps adaptation.
-        snr_internal = snr_mel / (snr_mel + self.snr_half_sat)
+        snr_safe = snr_mel.clamp(0.0, 1.0)  # Guarantee valid range from SNREstimator
+        snr_internal = snr_safe / (snr_safe + self.snr_half_sat)
         snr_mean = snr_internal.mean(dim=-1, keepdim=True)  # (B, L, 1)
 
         # SNR-Adaptive Delta Floor
@@ -1433,7 +1442,8 @@ class SelectivityModulatedSSM(SpectralAwareSSM_v2):
         # 2. SNR-based selectivity gate σ (enhanced)
         # ================================================================
         # Michaelis-Menten re-normalization (from SA-SSM v2)
-        snr_internal = snr_mel / (snr_mel + self.snr_half_sat)
+        snr_safe = snr_mel.clamp(0.0, 1.0)  # Guarantee valid range
+        snr_internal = snr_safe / (snr_safe + self.snr_half_sat)
         snr_mean = snr_internal.mean(dim=-1, keepdim=True)  # (B, L, 1)
 
         # [Enhancement 1] Temporal smoothing: causal 3-frame average
@@ -1610,7 +1620,8 @@ class NoiseCondSMSSM(SelectivityModulatedSSM):
         # 2. NC-SSM: Per-sub-band selectivity gate σ
         # ================================================================
         # Michaelis-Menten re-normalization
-        snr_internal = snr_mel / (snr_mel + self.snr_half_sat)
+        snr_safe = snr_mel.clamp(0.0, 1.0)  # Guarantee valid range
+        snr_internal = snr_safe / (snr_safe + self.snr_half_sat)
 
         # ★ NC-1: Pool n_mels mel bands → d_state sub-bands (one per state)
         # Adaptive pooling handles any n_mels/d_state ratio (e.g., 40/6)
@@ -2820,9 +2831,8 @@ class NanoMambaBlock(nn.Module):
         # Output projection + residual
         out = self.out_proj(y) + residual
 
-        # NaN safety: prevent NaN from propagating between blocks
-        if torch.isnan(out).any():
-            out = torch.nan_to_num(out, nan=0.0)
+        # NaN safety: unconditional guard (avoids gradient graph discontinuity)
+        out = torch.nan_to_num(out, nan=0.0, posinf=1e4, neginf=-1e4)
         return out
 
 
