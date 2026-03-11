@@ -1523,10 +1523,11 @@ class NoiseCondSMSSM(SelectivityModulatedSSM):
 
     1. Per-sub-band selectivity (core innovation):
        SM-SSM: mean(40 bands) → scalar σ → all states same SNR
-       NC-SSM: pool(40→5 sub-bands) → per-state σ → each state uses
+       NC-SSM: pool(40→N sub-bands) → per-state σ → each state uses
                its frequency sub-band's SNR for selectivity control.
+       Uses adaptive avg pooling → works with any d_state (5, 6, 8, ...).
        State 0 ↔ Sub-band 0 (low freq): factory noise → σ≈0 (LTI mode)
-       State 4 ↔ Sub-band 4 (high freq): factory noise → σ≈1 (selective)
+       State N-1 ↔ Sub-band N-1 (high freq): factory noise → σ≈1 (selective)
 
     2. Stationarity-conditioned Δ floor:
        Stationary noise → boost Δ floor → longer memory → better averaging
@@ -1536,8 +1537,8 @@ class NoiseCondSMSSM(SelectivityModulatedSSM):
        Broadband noise (white) → B_base unchanged (all states equal)
        Narrowband noise (factory) → B_base modulated per state
 
-    Extra parameters per block: d_state + 1 + d_state = 11 (d_state=5)
-    Total: 22 params for 2 blocks (0.30% overhead)
+    Extra parameters per block: d_state + 1 + d_state = 2*d_state + 1
+      d_state=5: 11/block, 22 total | d_state=6: 13/block, 26 total
 
     Initialization: all NC-SSM params set to reproduce SM-SSM behavior
     exactly, enabling warm-start from SM-SSM checkpoints.
@@ -1563,8 +1564,9 @@ class NoiseCondSMSSM(SelectivityModulatedSSM):
             torch.zeros(d_state))                       # d_state p
 
         # Sub-band configuration
-        self.n_sub_bands = d_state  # 5 sub-bands for d_state=5
-        self.bands_per_sub = n_mels // d_state  # 40/5 = 8
+        # Supports any d_state via adaptive pooling (40→d_state sub-bands)
+        self.n_sub_bands = d_state
+        self.n_mels = n_mels
 
     def forward(self, x, snr_mel, pcen_gate=None):
         """
@@ -1592,10 +1594,12 @@ class NoiseCondSMSSM(SelectivityModulatedSSM):
         # Michaelis-Menten re-normalization
         snr_internal = snr_mel / (snr_mel + self.snr_half_sat)
 
-        # ★ NC-1: Pool 40 mel bands → 5 sub-bands (one per state)
-        snr_sub = snr_internal.reshape(
-            Bs, L, self.n_sub_bands, self.bands_per_sub
-        ).mean(dim=-1)  # (B, L, 5)
+        # ★ NC-1: Pool n_mels mel bands → d_state sub-bands (one per state)
+        # Adaptive pooling handles any n_mels/d_state ratio (e.g., 40/6)
+        snr_sub = F.adaptive_avg_pool1d(
+            snr_internal.reshape(Bs * L, 1, self.n_mels),
+            self.n_sub_bands
+        ).reshape(Bs, L, self.n_sub_bands)  # (B, L, d_state)
 
         # Global mean for dt (scalar) — same as SM-SSM
         snr_mean = snr_sub.mean(dim=-1, keepdim=True)  # (B, L, 1)
@@ -3899,18 +3903,19 @@ def create_nanomamba_nc_matched(n_classes=12):
     frequency sub-band's SNR rather than a scalar average.
 
     Key innovations over SM-SSM:
-    1. Per-sub-band σ_BC: 40 mel → 5 sub-bands → per-state selectivity
+    1. Per-sub-band σ_BC: 40 mel → 6 sub-bands → per-state selectivity
        Factory noise (low-freq) → only low-freq states go LTI, rest stay selective
+       6 sub-bands (vs SM-SSM's 5): finer frequency resolution
     2. Stationarity-conditioned Δ floor: pcen_gate modulates minimum step size
     3. Spectral-flatness-conditioned B_base: broadband noise → stronger fixed input
     4. Learned Spectral Gate (LSG): explicit per-freq noise suppression before PCEN
 
-    d_model=20 (vs SM-SSM's 21) to accommodate LSG (120p) + NC-SSM extras (22p).
-    ~7,195 params (269p margin under BC-ResNet-1's 7,464).
+    d_model=20, d_state=6: capacity-matched to BC-ResNet-1.
+    7,443 params (21p margin under BC-ResNet-1's 7,464).
     """
     return NanoMamba(
         n_mels=40, n_classes=n_classes,
-        d_model=20, d_state=5, d_conv=3, expand=1.5,
+        d_model=20, d_state=6, d_conv=3, expand=1.5,
         n_layers=2, use_dual_pcen_v2=True,
         use_ssm_v2=True, use_nc_ssm=True, use_lsg=True)
 

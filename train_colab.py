@@ -1746,10 +1746,18 @@ def analyze_selectivity_gates(model, val_loader, device, dataset_audios=None,
                        if m.__class__.__name__ == 'NoiseCondSMSSM']
 
     n_blocks = len(ssm_modules)
-    n_states = ssm_modules[0][1].d_state  # typically 5
+    n_states = ssm_modules[0][1].d_state  # 5 or 6
+    n_mels = 40
 
-    # Sub-band frequency labels (40 mel → 5 sub-bands of 8 bands each)
-    band_labels = ['0-500Hz', '500-1kHz', '1-2kHz', '2-4kHz', '4-8kHz']
+    # Sub-band frequency labels (dynamic based on d_state)
+    mel_freqs = [0, 500, 1000, 2000, 4000, 6000, 8000]  # approximate mel boundaries
+    band_labels = []
+    for i in range(n_states):
+        lo_idx = int(i * n_mels / n_states)
+        hi_idx = int((i + 1) * n_mels / n_states) - 1
+        lo_hz = mel_freqs[min(i, len(mel_freqs) - 1)]
+        hi_hz = mel_freqs[min(i + 1, len(mel_freqs) - 1)]
+        band_labels.append(f'{lo_hz}-{hi_hz}Hz')
 
     print("\n" + "=" * 80)
     print(f"  PER-SUB-BAND SELECTIVITY ANALYSIS ({ssm_type}, {n_blocks} blocks)")
@@ -1921,9 +1929,23 @@ def analyze_subband_perturbation(model, val_loader, device,
     Returns:
         dict with per-sub-band accuracy and drop for each model
     """
-    n_sub_bands = 5
-    bands_per_sub = 8  # 40 mels / 5 sub-bands
-    band_labels = ['0-500Hz', '500-1kHz', '1-2kHz', '2-4kHz', '4-8kHz']
+    # Dynamic sub-band configuration (supports d_state=5, 6, etc.)
+    n_mels = 40
+    # Detect d_state from model if it's an NC-SSM/SM-SSM
+    n_sub_bands = 5  # default
+    for m in model.modules():
+        if hasattr(m, 'n_sub_bands'):
+            n_sub_bands = m.n_sub_bands
+            break
+    # Compute band boundaries using adaptive pooling logic (same as NC-SSM)
+    band_boundaries = [int(i * n_mels / n_sub_bands) for i in range(n_sub_bands + 1)]
+    bands_per_sub_list = [band_boundaries[i+1] - band_boundaries[i] for i in range(n_sub_bands)]
+    mel_freqs = [0, 500, 1000, 2000, 4000, 6000, 8000]
+    band_labels = []
+    for i in range(n_sub_bands):
+        lo_hz = mel_freqs[min(i, len(mel_freqs) - 1)]
+        hi_hz = mel_freqs[min(i + 1, len(mel_freqs) - 1)]
+        band_labels.append(f'{lo_hz}-{hi_hz}Hz')
 
     print(f"\n" + "=" * 80)
     print(f"  SUB-BAND PERTURBATION ANALYSIS")
@@ -1958,8 +1980,8 @@ def analyze_subband_perturbation(model, val_loader, device,
     subband_accs = []
 
     for sb in range(n_sub_bands):
-        mask_start = sb * bands_per_sub
-        mask_end = (sb + 1) * bands_per_sub
+        mask_start = band_boundaries[sb]
+        mask_end = band_boundaries[sb + 1]
 
         # Register hook to zero out this sub-band in mel spectrogram
         mel_hooks = []
@@ -2094,11 +2116,17 @@ def compare_subband_perturbation(models_dict, val_loader, device,
       NC-SSM: high differentiation (different bands have different importance)
       BC-ResNet-1: low differentiation (all bands similarly important)
     """
-    band_labels = ['0-500Hz', '500-1kHz', '1-2kHz', '2-4kHz', '4-8kHz']
+    # Dynamic sub-band count from first model
     n_sub_bands = 5
+    for model in models_dict.values():
+        for m in model.modules():
+            if hasattr(m, 'n_sub_bands'):
+                n_sub_bands = m.n_sub_bands
+                break
+        break
 
     print(f"\n" + "=" * 80)
-    print(f"  COMPARATIVE SUB-BAND PERTURBATION ANALYSIS")
+    print(f"  COMPARATIVE SUB-BAND PERTURBATION ANALYSIS ({n_sub_bands} sub-bands)")
     print(f"  Noise: {noise_type} at {snr_db}dB")
     print(f"  Hypothesis: NC-SSM has HIGHER differentiation than CNN")
     print("=" * 80)
