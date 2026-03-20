@@ -111,6 +111,18 @@ try:
         # NC-SSM: Noise-Conditioned SM-SSM (per-sub-band selectivity + LSG)
         create_nanomamba_nc_matched,
         create_nanomamba_nc_large,
+        # NC-SSM + NanoSE: Sequential Enhancement Expert for extreme low-SNR
+        create_nanomamba_nc_nanose,
+        create_nanomamba_nc_nanose_v3,
+        create_nanomamba_nc_matched_nanose,
+        # NC-SSM Parameter Scaling Study (12K/15K/20K)
+        create_nanomamba_nc_12k,
+        create_nanomamba_nc_15k,
+        create_nanomamba_nc_20k,
+        create_nanomamba_nc_20k_ss,
+        create_nanomamba_nc_15k_ss,
+        create_nanomamba_nc_12k_ss,
+        profile_model, profile_all_models,
     )
     print("  [OK] nanomamba.py loaded successfully")
 except ImportError:
@@ -337,6 +349,252 @@ class SpeechCommandsDataset(Dataset):
 
 
 # ============================================================================
+# Fluent Speech Commands (FSC) Dataset — 31-class Intent Classification
+# ============================================================================
+
+import csv
+
+FSC_INTENT_LABELS = None  # Populated dynamically from CSV data
+
+
+def _build_fsc_intent_map(csv_path):
+    """Read CSV and build sorted intent label list from (action, object, location) tuples."""
+    intents = set()
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            intent = (row['action'].strip(), row['object'].strip(), row['location'].strip())
+            intents.add(intent)
+    sorted_intents = sorted(intents)
+    label_list = [f"{a}_{o}_{l}" for a, o, l in sorted_intents]
+    intent_to_idx = {intent: i for i, intent in enumerate(sorted_intents)}
+    return label_list, intent_to_idx, sorted_intents
+
+
+def _download_fsc(data_dir):
+    """Download and extract FSC dataset if not present.
+
+    Expects the dataset to be manually placed or downloaded.
+    The FSC dataset requires accepting a license at:
+    https://fluent.ai/fluent-speech-commands-a-dataset-for-spoken-language-understanding/
+
+    Expected structure after extraction:
+        data_dir/fluent_speech_commands_dataset/
+            data/train_data.csv
+            data/valid_data.csv
+            data/test_data.csv
+            wavs/speakers/.../*.wav
+    """
+    fsc_root = os.path.join(data_dir, 'fluent_speech_commands_dataset')
+    train_csv = os.path.join(fsc_root, 'data', 'train_data.csv')
+    if os.path.isfile(train_csv):
+        return fsc_root
+
+    # Try downloading from the public URL
+    import urllib.request
+    import zipfile
+
+    url = 'http://www.fluent.ai/research/fluent-speech-commands/'
+    zip_path = os.path.join(data_dir, 'fluent_speech_commands_dataset.tar.gz')
+
+    # Check if tar.gz already exists
+    if not os.path.isfile(zip_path):
+        print(f"  FSC dataset not found at {fsc_root}")
+        print(f"  Please download the Fluent Speech Commands dataset from:")
+        print(f"    {url}")
+        print(f"  and extract it to: {data_dir}/fluent_speech_commands_dataset/")
+        print(f"  Expected CSV: {train_csv}")
+        sys.exit(1)
+
+    # Extract if tar.gz exists
+    import tarfile
+    print(f"  Extracting {zip_path}...")
+    with tarfile.open(zip_path, 'r:gz') as tar:
+        tar.extractall(data_dir)
+    print("  Extraction complete.")
+
+    if not os.path.isfile(train_csv):
+        print(f"  [ERROR] After extraction, expected CSV not found: {train_csv}")
+        sys.exit(1)
+
+    return fsc_root
+
+
+class FluentSpeechCommandsDataset(Dataset):
+    """Fluent Speech Commands — 31-class intent classification.
+
+    Each utterance is labeled with (action, object, location) → 31 unique intents.
+    Audio is padded/truncated to 1 second (16000 samples) to match GSC pipeline.
+
+    Note: FSC utterances are typically 1-4 seconds. Truncating to 1 second
+    loses some information but keeps compatibility with the existing pipeline.
+    For best FSC results, consider increasing clip_duration_ms.
+    """
+
+    def __init__(self, fsc_root, subset='training', n_mels=40, sr=16000,
+                 clip_duration_ms=1000, augment=False):
+        super().__init__()
+        self.sr = sr
+        self.n_mels = n_mels
+        self.target_length = int(sr * clip_duration_ms / 1000)
+        self.augment = augment
+        self.subset = subset
+        self.fsc_root = fsc_root
+
+        # Map subset names to CSV files
+        csv_map = {
+            'training': 'train_data.csv',
+            'validation': 'valid_data.csv',
+            'testing': 'test_data.csv',
+        }
+        csv_path = os.path.join(fsc_root, 'data', csv_map[subset])
+        if not os.path.isfile(csv_path):
+            print(f"  [ERROR] FSC CSV not found: {csv_path}")
+            sys.exit(1)
+
+        # Build intent label map from training CSV (consistent across splits)
+        train_csv = os.path.join(fsc_root, 'data', 'train_data.csv')
+        self.label_list, self.intent_to_idx, self.sorted_intents = \
+            _build_fsc_intent_map(train_csv)
+        self.labels = self.label_list
+        self.label_to_idx = {l: i for i, l in enumerate(self.labels)}
+
+        global FSC_INTENT_LABELS
+        FSC_INTENT_LABELS = self.label_list
+
+        # Parse CSV to build sample list
+        self.samples = []
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # Path in CSV is relative to fsc_root
+                audio_path = os.path.join(fsc_root, row['path'].strip())
+                intent = (row['action'].strip(), row['object'].strip(),
+                          row['location'].strip())
+                if intent in self.intent_to_idx:
+                    label_idx = self.intent_to_idx[intent]
+                    self.samples.append((audio_path, label_idx))
+
+        # Mel spectrogram parameters (same as GSC)
+        self.n_fft = 512
+        self.hop_length = 160
+        self.win_length = 400
+        self.mel_fb = self._create_mel_fb()
+
+        # Count per class
+        class_counts = {}
+        for _, idx in self.samples:
+            lbl = self.labels[idx]
+            class_counts[lbl] = class_counts.get(lbl, 0) + 1
+
+        print(f"  [{subset}] {len(self.samples)} samples, "
+              f"{len(self.labels)} classes ({len(self.intent_to_idx)} intents)")
+
+    def _create_mel_fb(self):
+        n_freq = self.n_fft // 2 + 1
+        mel_low = 0
+        mel_high = 2595 * np.log10(1 + self.sr / 2 / 700)
+        mel_points = np.linspace(mel_low, mel_high, self.n_mels + 2)
+        hz_points = 700 * (10 ** (mel_points / 2595) - 1)
+        bin_points = np.floor((self.n_fft + 1) * hz_points / self.sr).astype(int)
+
+        fb = np.zeros((self.n_mels, n_freq), dtype=np.float32)
+        for i in range(self.n_mels):
+            for j in range(bin_points[i], bin_points[i + 1]):
+                if j < n_freq:
+                    fb[i, j] = ((j - bin_points[i]) /
+                                max(bin_points[i + 1] - bin_points[i], 1))
+            for j in range(bin_points[i + 1], bin_points[i + 2]):
+                if j < n_freq:
+                    fb[i, j] = ((bin_points[i + 2] - j) /
+                                max(bin_points[i + 2] - bin_points[i + 1], 1))
+        return torch.from_numpy(fb)
+
+    def _load_audio(self, path):
+        try:
+            waveform, sr = torchaudio.load(path)
+            if sr != self.sr:
+                waveform = torchaudio.functional.resample(waveform, sr, self.sr)
+            audio = waveform[0]
+        except Exception:
+            audio = torch.zeros(self.target_length)
+
+        # Pad or trim to target length
+        if len(audio) < self.target_length:
+            audio = F.pad(audio, (0, self.target_length - len(audio)))
+        elif len(audio) > self.target_length:
+            audio = audio[:self.target_length]
+
+        return audio
+
+    def _compute_mel(self, audio):
+        window = torch.hann_window(self.win_length)
+        spec = torch.stft(audio, self.n_fft, self.hop_length,
+                          self.win_length, window=window,
+                          return_complex=True)
+        mag = spec.abs()
+        mel = torch.matmul(self.mel_fb, mag)
+        mel = torch.log(mel + 1e-8)
+        return mel
+
+    def _augment(self, audio):
+        shift = np.random.randint(-1600, 1600)
+        if shift > 0:
+            audio = F.pad(audio[shift:], (0, shift))
+        elif shift < 0:
+            audio = F.pad(audio[:shift], (-shift, 0))
+        vol = np.random.uniform(0.8, 1.2)
+        audio = audio * vol
+        if np.random.random() < 0.3:
+            noise = torch.randn_like(audio) * 0.005
+            audio = audio + noise
+        return audio
+
+    def cache_all(self):
+        """Pre-load all audio into RAM for fast training."""
+        print(f"  Caching {len(self.samples)} samples to RAM...", end=" ",
+              flush=True)
+        self._cache_audio = []
+        self._cache_mel = []
+        self._cache_labels = []
+        for i, (path, label) in enumerate(self.samples):
+            audio = self._load_audio(path)
+            mel = self._compute_mel(audio)
+            self._cache_audio.append(audio)
+            self._cache_mel.append(mel)
+            self._cache_labels.append(label)
+            if (i + 1) % 10000 == 0:
+                print(f"{i+1}", end=" ", flush=True)
+        self._cache_audio = torch.stack(self._cache_audio)
+        self._cache_mel = torch.stack(self._cache_mel)
+        self._cache_labels = torch.tensor(self._cache_labels, dtype=torch.long)
+        self._cached = True
+        mem_mb = (self._cache_audio.nelement() * 4 +
+                  self._cache_mel.nelement() * 4) / 1024**2
+        print(f"Done! ({mem_mb:.0f} MB)", flush=True)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        if hasattr(self, '_cached') and self._cached:
+            audio = self._cache_audio[idx]
+            mel = self._cache_mel[idx]
+            label = self._cache_labels[idx].item()
+            if self.augment:
+                audio = self._augment(audio.clone())
+                mel = self._compute_mel(audio)
+            return mel, label, audio
+
+        path, label = self.samples[idx]
+        audio = self._load_audio(path)
+        if self.augment:
+            audio = self._augment(audio)
+        mel = self._compute_mel(audio)
+        return mel, label, audio
+
+
+# ============================================================================
 # Model EMA (Exponential Moving Average)
 # ============================================================================
 
@@ -396,7 +654,8 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, device,
                     n_fft=512, hop_length=160, n_mels=40,
                     total_epochs=30, noise_curriculum_v2=False,
                     ss_train=False,
-                    ema=None):
+                    ema=None, low_snr_boost=False,
+                    hard_epochs=0):
     """Train one epoch with Per-Sample Multi-Condition Noise Augmentation.
 
     [KEY INSIGHT] Why noise-aug helps NanoMamba MORE than CNN:
@@ -445,6 +704,9 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, device,
     total_loss = 0
     correct = 0
     total = 0
+    sf_loss_sum = 0.0
+    sf_loss_count = 0
+    snr_sampled_all = []  # Track all sampled SNR values
 
     # ================================================================
     # Noise Configuration: Per-sample diversity with curriculum
@@ -453,7 +715,11 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, device,
     # Phase-based curriculum
     WARM_UP_EPOCHS = 3   # Clean-only warm-up
     GENTLE_END = 10      # Easy noise phase
-    MODERATE_END = 20    # Moderate noise phase
+    if hard_epochs > 0:
+        # Custom HARD duration: start HARD at (total_epochs - hard_epochs)
+        MODERATE_END = max(GENTLE_END + 1, total_epochs - hard_epochs)
+    else:
+        MODERATE_END = 15 if low_snr_boost else 20    # Default: earlier hard if boosted
 
     if epoch < WARM_UP_EPOCHS:
         # Phase 0: Clean-only warm-up — stabilize Expert1 / CNN baseline
@@ -493,9 +759,10 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, device,
             # [v2] Phase 3: Extend to evaluation-matching range (-15dB).
             # Gaussian annealing ensures gradual exposure — extreme samples
             # are initially rare, becoming frequent as _snr_center drops.
-            snr_range = (-15, 10)
+            snr_range = (-15, 5) if low_snr_boost else (-15, 10)
             noise_types_pool = ['factory', 'white', 'babble', 'street', 'pink']
-            phase_name = f"HARD-ALL (ratio={effective_ratio:.2f}, SNR {snr_range[0]}~{snr_range[1]}dB)"
+            boost_tag = "-BOOST" if low_snr_boost else ""
+            phase_name = f"HARD-ALL{boost_tag} (ratio={effective_ratio:.2f}, SNR {snr_range[0]}~{snr_range[1]}dB)"
         else:
             snr_range = (-5, 10)
             noise_types_pool = ['factory', 'white', 'babble', 'street', 'pink']
@@ -505,9 +772,9 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, device,
         labels = labels.to(device)
         audio = audio.to(device)
         mel = mel.to(device)
+        B = audio.size(0)
 
         if effective_noise_aug and effective_ratio > 0:
-            B = audio.size(0)
             n_noisy = int(B * effective_ratio)
 
             if n_noisy > 0:
@@ -537,21 +804,38 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, device,
 
                 for i in range(n_noisy):
                     # Random noise type per sample
-                    noise_type_i = noise_types_pool[
-                        np.random.randint(len(noise_types_pool))]
+                    # [White/Pink boost] In HARD phase, oversample broadband noise
+                    if (epoch >= MODERATE_END and low_snr_boost
+                            and len(noise_types_pool) > 0):
+                        _wp_weights = np.array([
+                            1.3 if nt in ('white', 'pink') else 1.0
+                            for nt in noise_types_pool])
+                        _wp_weights /= _wp_weights.sum()
+                        noise_type_i = noise_types_pool[
+                            np.random.choice(len(noise_types_pool), p=_wp_weights)]
+                    else:
+                        noise_type_i = noise_types_pool[
+                            np.random.randint(len(noise_types_pool))]
                     # Random SNR per sample
                     if noise_curriculum_v2 and _snr_center is not None:
                         # [v2] Gaussian centered at current difficulty frontier
-                        # std=4.0 covers the wider Phase 3 range (-15~10dB = 25dB)
-                        snr_db_i = np.clip(
-                            np.random.normal(_snr_center, 4.0),
-                            snr_range[0], snr_range[1])
+                        # [White/Pink boost] lower center + wider std for broadband
+                        if (low_snr_boost and epoch >= MODERATE_END
+                                and noise_type_i in ('white', 'pink')):
+                            snr_db_i = np.clip(
+                                np.random.normal(_snr_center - 3.0, 5.0),
+                                snr_range[0], snr_range[1])
+                        else:
+                            snr_db_i = np.clip(
+                                np.random.normal(_snr_center, 4.0),
+                                snr_range[0], snr_range[1])
                     else:
                         # [v1] Uniform random
                         snr_db_i = np.random.uniform(snr_range[0], snr_range[1])
 
                     noise_types_per_sample.append(noise_type_i)
                     snr_dbs_per_sample.append(snr_db_i)
+                    snr_sampled_all.append(snr_db_i)
 
                     # Generate noise for this sample
                     noise_i = generate_noise_signal(
@@ -577,20 +861,38 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, device,
                         noisy_audio, n_fft, hop_length, mel_fb, device)
                     logits = model(noisy_mel)
                 else:
-                    logits = model(noisy_audio)
+                    # Build snr_hint for NASG Teacher-Student
+                    # snr_hint = tanh(SNR_dB / 10) for noisy samples,
+                    #            tanh(25/10) ≈ 0.987 for clean samples
+                    snr_hint = torch.full((B,), math.tanh(25.0 / 10.0),
+                                          device=device)
+                    for si, snr_db_val in enumerate(snr_dbs_per_sample):
+                        snr_hint[si] = math.tanh(snr_db_val / 10.0)
+                    logits = model(noisy_audio, snr_hint=snr_hint)
             else:
                 if is_cnn:
                     logits = model(mel)
                 else:
-                    logits = model(audio)
+                    # No noise aug this batch → clean, snr_hint ≈ 1.0
+                    snr_hint = torch.full((B,), math.tanh(25.0 / 10.0),
+                                          device=device)
+                    logits = model(audio, snr_hint=snr_hint)
         else:
             # Clean training (warm-up phase or noise_aug disabled)
             if is_cnn:
                 logits = model(mel)
             else:
-                logits = model(audio)
+                # Clean-only training, snr_hint ≈ 1.0
+                snr_hint = torch.full((B,), math.tanh(25.0 / 10.0),
+                                      device=device)
+                logits = model(audio, snr_hint=snr_hint)
 
         loss = criterion(logits, labels)
+
+        # Phase 1B removed: per-sample loss weighting (2.0× for white/pink at
+        # extreme SNR) was too aggressive and caused training instability.
+        # Combined with Phase 1A 2× sampling, it created 66% white/pink bias
+        # and accuracy dropped from 92% to 82% in HARD phase.
 
         # ============================================================
         # NaN safety: detect NaN in logits/loss and skip batch
@@ -632,6 +934,18 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, device,
                     routing_l2_loss = F.mse_loss(gate_l2_pred[:n_noisy], gate_l2_targets)
                     # Half weight for L2 — less critical than L1 routing
                     loss = loss + (routing_weight * 0.5) * routing_l2_loss
+
+        # [SF Bridge] Auxiliary supervision: train sf_to_snr mapping
+        # mel.detach() in forward() ensures estimation noise doesn't propagate
+        # Only sf_to_snr_scale/bias receive gradients from this loss
+        if (not is_cnn and hasattr(model, '_sf_snr_est')
+                and model._sf_snr_est is not None):
+            sf_target = snr_hint.detach()  # oracle SNR as supervision target
+            sf_pred = model._sf_snr_est.squeeze(-1)  # (B,)
+            sf_bridge_loss = F.mse_loss(sf_pred, sf_target)
+            loss = loss + 0.5 * sf_bridge_loss
+            sf_loss_sum += sf_bridge_loss.item()
+            sf_loss_count += 1
 
         optimizer.zero_grad()
         loss.backward()
@@ -676,7 +990,12 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, device,
                   f"Loss: {total_loss/total:.4f} Acc: {acc:.1f}%{aug_str}",
                   flush=True)
 
-    return total_loss / total, 100. * correct / total
+    sf_loss_avg = sf_loss_sum / max(sf_loss_count, 1)
+    snr_stats = None
+    if snr_sampled_all:
+        snr_arr = np.array(snr_sampled_all)
+        snr_stats = (snr_arr.min(), snr_arr.mean(), snr_arr.max(), len(snr_arr))
+    return total_loss / total, 100. * correct / total, sf_loss_avg, snr_stats
 
 
 def _compute_mel_batch(audio, n_fft, hop_length, mel_fb, device):
@@ -717,8 +1036,74 @@ def evaluate(model, val_loader, device):
 # Noise Generation (Audio-Domain)
 # ============================================================================
 
+
+# --- DEMAND dataset (real recorded noise) ---
+_demand_cache = {}
+
+def _load_demand_noise(demand_type, length, sr=16000):
+    """Load real recorded noise from DEMAND dataset.
+
+    DEMAND types: DKITCHEN, DLIVING, DWASHING, NFIELD, NPARK, NRIVER,
+                  OHALLWAY, OMEETING, OOFFICE, PCAFE, PRESTO, PSTATION,
+                  SCAFE, SPSQUARE, STRAFFIC, TBUS, TCAR, TMETRO
+
+    Mapped short names: demand_kitchen, demand_cafe, demand_traffic,
+                        demand_living, demand_office, demand_bus
+    """
+    demand_map = {
+        'demand_kitchen': 'DKITCHEN', 'demand_living': 'DLIVING',
+        'demand_washing': 'DWASHING', 'demand_field': 'NFIELD',
+        'demand_park': 'NPARK', 'demand_river': 'NRIVER',
+        'demand_hallway': 'OHALLWAY', 'demand_meeting': 'OMEETING',
+        'demand_office': 'OOFFICE', 'demand_cafe': 'PCAFETERIA',
+        'demand_resto': 'PRESTO', 'demand_station': 'PSTATION',
+        'demand_square': 'SPSQUARE', 'demand_traffic': 'STRAFFIC',
+        'demand_bus': 'TBUS', 'demand_car': 'TCAR', 'demand_metro': 'TMETRO',
+    }
+
+    folder_name = demand_map.get(demand_type, demand_type.upper())
+    demand_dirs = [
+        Path('/content/DEMAND'),
+        Path('/content/drive/MyDrive/DEMAND'),
+        Path('DEMAND'),
+    ]
+
+    wav_path = None
+    for d in demand_dirs:
+        p = d / folder_name / 'ch01.wav'
+        if p.exists():
+            wav_path = p
+            break
+
+    if wav_path is None:
+        print(f"    ⚠ DEMAND {folder_name} not found, falling back to white noise")
+        noise = torch.randn(length)
+        return noise / (noise.abs().max() + 1e-8) * 0.7
+
+    # Cache the full recording
+    if str(wav_path) not in _demand_cache:
+        import torchaudio
+        waveform, orig_sr = torchaudio.load(str(wav_path))
+        if orig_sr != sr:
+            waveform = torchaudio.functional.resample(waveform, orig_sr, sr)
+        _demand_cache[str(wav_path)] = waveform[0]  # mono ch01
+
+    full_noise = _demand_cache[str(wav_path)]
+
+    # Random crop
+    if len(full_noise) <= length:
+        noise = full_noise.repeat(length // len(full_noise) + 1)[:length]
+    else:
+        start = np.random.randint(0, len(full_noise) - length)
+        noise = full_noise[start:start + length]
+
+    return noise / (noise.abs().max() + 1e-8) * 0.7
+
+
 def generate_noise_signal(noise_type, length, sr=16000, dataset_audios=None):
-    if noise_type == 'factory':
+    if noise_type.startswith('demand_'):
+        return _load_demand_noise(noise_type, length, sr)
+    elif noise_type == 'factory':
         return _generate_factory_noise(length, sr)
     elif noise_type == 'white':
         noise = torch.randn(length)
@@ -1030,6 +1415,90 @@ def spectral_subtraction_v2(noisy_audio, n_fft=512, hop_length=160):
     return enhanced
 
 
+def spectral_subtraction_v3(noisy_audio, n_fft=512, hop_length=160):
+    """SS v3: Wiener gain + aggressive noise removal for LSG-equipped models.
+
+    SS v2 uses subtractive approach (mag - alpha*noise) → artifacts at low SNR.
+    SS v3 uses multiplicative Wiener gain → cleaner output, compatible with LSG.
+
+    Key changes from v2:
+      1. Wiener gain instead of subtraction: G = max(1 - alpha*(N/X)^2, floor)
+         → No negative spectrum artifacts, smoother attenuation
+      2. More aggressive at low SNR: alpha up to 5.0 (vs v2's 3.0)
+      3. No SF weighting at extreme SNR: at -15dB, full suppression regardless
+         of noise type (LSG handles residual noise-type-specific shaping)
+      4. Lower spectral floor: 5%/1% (vs v2's 15%/3%) → more noise removed
+      5. Power-domain Wiener gain: (|X|^2 - alpha*|N|^2) / |X|^2
+
+    Design philosophy: SS v3 does heavy gross noise removal (audio domain),
+    LSG does fine residual shaping (mel domain). No double-counting.
+
+    Args:
+        noisy_audio: (B, T) or (T,) waveform tensor
+        n_fft: FFT size (512 = 32ms @ 16kHz)
+        hop_length: hop size (160 = 10ms @ 16kHz)
+    Returns:
+        enhanced: (B, T) or (T,) enhanced waveform
+    """
+    squeeze = False
+    if noisy_audio.dim() == 1:
+        noisy_audio = noisy_audio.unsqueeze(0)
+        squeeze = True
+
+    window = torch.hann_window(n_fft, device=noisy_audio.device)
+    spec = torch.stft(noisy_audio, n_fft, hop_length, window=window,
+                      return_complex=True)  # (B, F, T_frames)
+    mag = spec.abs()
+    phase = spec.angle()
+    B, F, T_frames = mag.shape
+
+    # Running minimum statistics noise estimation (same as v2)
+    n_init = min(5, T_frames)
+    noise_est = mag[..., :n_init].mean(dim=-1, keepdim=True).expand_as(mag).clone()
+    alpha_noise = 0.95
+
+    for t in range(1, T_frames):
+        frame_power = mag[..., t:t+1]
+        local_min = torch.minimum(frame_power, noise_est[..., t-1:t])
+        noise_est[..., t:t+1] = (alpha_noise * noise_est[..., t-1:t] +
+                                  (1.0 - alpha_noise) * local_min)
+
+    # Per-frame SNR estimation
+    frame_power_avg = mag.pow(2).mean(dim=1, keepdim=True)
+    noise_power_avg = noise_est.pow(2).mean(dim=1, keepdim=True)
+    frame_snr = 10.0 * torch.log10(
+        frame_power_avg / (noise_power_avg + 1e-10) + 1e-10)
+
+    # [v3] More aggressive oversubtraction: range [1.0, 5.0] (vs v2's [0.5, 3.0])
+    # At -15dB: alpha ≈ 5.0, at +5dB: alpha ≈ 1.0
+    alpha = 1.0 + 4.0 * torch.sigmoid(-0.3 * (frame_snr - 5.0))
+
+    # [v3] No SF weighting — let LSG handle noise-type-specific shaping
+    # SS v3 does uniform heavy suppression, LSG refines per-frequency
+
+    # [v3] Wiener gain (power domain): G = max(1 - alpha * (N/X)^2, floor)
+    noise_ratio = (noise_est.pow(2)) / (mag.pow(2) + 1e-10)  # (B, F, T)
+    gain = (1.0 - alpha * noise_ratio).clamp(min=0.0)        # (B, F, T)
+
+    # [v3] Lower frequency-weighted floor: 5% low-freq, 1% high-freq
+    # Less speech protection → more noise removed → LSG handles residual
+    freq_floor = torch.linspace(0.05, 0.01, F, device=mag.device)
+    freq_floor = freq_floor.unsqueeze(0).unsqueeze(-1)  # (1, F, 1)
+    gain = torch.maximum(gain, freq_floor)
+
+    # Apply Wiener gain (multiplicative → no negative spectrum)
+    enhanced_mag = gain * mag
+
+    # Reconstruct waveform
+    enhanced_spec = enhanced_mag * torch.exp(1j * phase)
+    enhanced = torch.istft(enhanced_spec, n_fft, hop_length, window=window,
+                           length=noisy_audio.size(-1))
+
+    if squeeze:
+        enhanced = enhanced.squeeze(0)
+    return enhanced
+
+
 # ============================================================================
 # GTCRN Pre-trained Enhancer (23.7K params, ICASSP 2024)
 # ============================================================================
@@ -1300,6 +1769,7 @@ def evaluate_noisy(model, val_loader, device, noise_type='factory',
                    use_enhancer=False, enhancer_type='spectral',
                    gtcrn_model=None, enhancer_bypass=False,
                    bypass_threshold=-2.0, bypass_scale=3.0,
+                   sf_range=2.0,
                    ss_version='v2', bypass_version='v2',
                    is_cnn=False, mel_fb=None):
     """Evaluate under noisy conditions with optional front-end enhancer.
@@ -1312,13 +1782,18 @@ def evaluate_noisy(model, val_loader, device, noise_type='factory',
         enhancer_bypass: if True, apply SNR-adaptive bypass (blend original + enhanced)
         bypass_threshold: SNR threshold in dB for bypass gate center
         bypass_scale: sigmoid steepness (higher = sharper transition)
-        ss_version: 'v1' (fixed oversubtract) or 'v2' (adaptive oversubtract + freq floor)
+        ss_version: 'v1' (fixed), 'v2' (adaptive + freq floor), 'v3' (Wiener gain, aggressive)
         bypass_version: 'v1' (fixed threshold) or 'v2' (noise-type-aware threshold)
         is_cnn: if True, model expects mel input → compute mel from noisy audio
         mel_fb: mel filterbank tensor (required if is_cnn=True)
     """
     # Select SS function based on version
-    ss_fn = spectral_subtraction_v2 if ss_version == 'v2' else spectral_subtraction_enhance
+    if ss_version == 'v3':
+        ss_fn = spectral_subtraction_v3
+    elif ss_version == 'v2':
+        ss_fn = spectral_subtraction_v2
+    else:
+        ss_fn = spectral_subtraction_enhance
 
     model.eval()
     correct = 0
@@ -1346,7 +1821,8 @@ def evaluate_noisy(model, val_loader, device, noise_type='factory',
                     noisy_audio = noise_aware_bypass(
                         original, enhanced,
                         bypass_threshold=bypass_threshold,
-                        bypass_scale=bypass_scale)
+                        bypass_scale=bypass_scale,
+                        sf_range=sf_range)
                 else:
                     # [v1] Fixed-threshold bypass (original)
                     snr_est = estimate_snr_simple(original)  # (B, 1)
@@ -1371,6 +1847,214 @@ def evaluate_noisy(model, val_loader, device, noise_type='factory',
         total += labels.size(0)
 
     return 100. * correct / total
+
+
+# ============================================================================
+# Noise Propagation Diagnostic — CNN vs SSM comparison
+# ============================================================================
+
+@torch.no_grad()
+def diagnose_noise_propagation(model, val_loader, device, dataset_audios=None,
+                               cnn_model=None, mel_fb=None,
+                               noise_types=('white', 'pink', 'factory'),
+                               snr_dbs=(-15, -5, 0, 10),
+                               max_batches=5):
+    """Measure and compare noise propagation between SSM and CNN models.
+
+    Theory check: NC-SSM with NASG should achieve Var[y_noise] ∝ σ² (= CNN bound).
+    State masking should further reduce the constant factor.
+
+    Prints a diagnostic table:
+      - Per-state hidden state ||h_n||² (SSM only)
+      - Output variance Var[y] for both SSM and CNN
+      - NASG gate value g (should → 0 at low SNR)
+      - State gate values m_n (should reduce at low SNR)
+      - Noise amplification ratio: Var[y_noisy] / Var[y_clean]
+
+    Args:
+        model: NanoMamba model (SSM)
+        val_loader: validation data loader
+        device: torch device
+        dataset_audios: for babble noise generation
+        cnn_model: optional CNN model for A/B comparison
+        mel_fb: mel filterbank (required for CNN)
+        noise_types: noise types to test
+        snr_dbs: SNR levels to test (dB)
+        max_batches: number of batches to average over
+    """
+    model.eval()
+    if cnn_model is not None:
+        cnn_model.eval()
+
+    print("\n" + "=" * 80)
+    print("  NOISE PROPAGATION DIAGNOSTIC — CNN vs NC-SSM (NASG)")
+    print("  Theory: Var[y] = C · σ² for both CNN and LTI-SSM")
+    print("  Goal: NC-SSM's C_masked ≤ C_CNN (lower constant factor)")
+    print("=" * 80)
+
+    # 1. Measure clean baseline
+    ssm_clean_var = 0.0
+    cnn_clean_var = 0.0
+    n_clean = 0
+    import math as _math
+    for batch_idx, (mel, labels, audio) in enumerate(val_loader):
+        if batch_idx >= max_batches:
+            break
+        audio = audio.to(device)
+        # Oracle snr_hint for clean: tanh(25/10) ≈ 0.987
+        _B = audio.size(0)
+        _clean_hint = torch.full((_B,), _math.tanh(25.0 / 10.0), device=device)
+        _ = model(audio, snr_hint=_clean_hint)
+        # Collect output variance from SSM blocks
+        for block in _get_ssm_blocks(model):
+            ssm_clean_var += block._last_y_var.item()
+        n_clean += 1
+        if cnn_model is not None and mel_fb is not None:
+            mel_input = _compute_mel_batch(audio, 512, 160, mel_fb, device)
+            _ = cnn_model(mel_input)
+            # For CNN: measure output of final conv layer
+            cnn_clean_var += _get_cnn_output_var(cnn_model)
+
+    n_blocks = len(_get_ssm_blocks(model))
+    ssm_clean_var /= max(n_clean * n_blocks, 1)
+    cnn_clean_var /= max(n_clean, 1)
+
+    print(f"\n  📊 Clean baseline:")
+    print(f"     SSM output Var[y_clean] = {ssm_clean_var:.6f}")
+    if cnn_model is not None:
+        print(f"     CNN output Var[y_clean] = {cnn_clean_var:.6f}")
+
+    # 2. Measure noisy conditions
+    print(f"\n  {'Noise':>8s} {'SNR':>5s} │ {'SSM Var[y]':>12s} {'Amp.Ratio':>10s}"
+          f" │ {'NASG g':>8s} {'m_0':>6s} {'m_N-1':>6s} {'N_eff':>5s}"
+          f" │ {'||h||² per state':>30s}", end="")
+    if cnn_model is not None:
+        print(f" │ {'CNN Var[y]':>12s} {'CNN Amp.':>10s}", end="")
+    print()
+    print("  " + "─" * 130)
+
+    for noise_type in noise_types:
+        for snr_db in snr_dbs:
+            ssm_y_var = 0.0
+            ssm_h_var_sum = None
+            nasg_g_sum = 0.0
+            state_gate_sum = None
+            cnn_y_var = 0.0
+            n_samples = 0
+
+            for batch_idx, (mel, labels, audio) in enumerate(val_loader):
+                if batch_idx >= max_batches:
+                    break
+                audio = audio.to(device)
+
+                noise = generate_noise_signal(
+                    noise_type, audio.size(-1), sr=16000,
+                    dataset_audios=dataset_audios).to(device)
+                noisy_audio = mix_audio_at_snr(audio, noise, snr_db)
+
+                # SSM forward with oracle snr_hint
+                _B = audio.size(0)
+                _snr_hint = torch.full((_B,), _math.tanh(snr_db / 10.0), device=device)
+                _ = model(noisy_audio, snr_hint=_snr_hint)
+                for block in _get_ssm_blocks(model):
+                    ssm_y_var += block._last_y_var.item()
+                    if hasattr(block, '_last_h_var'):
+                        h_var = block._last_h_var.cpu()
+                        if ssm_h_var_sum is None:
+                            ssm_h_var_sum = h_var
+                        else:
+                            ssm_h_var_sum = ssm_h_var_sum + h_var
+                    if hasattr(block, '_last_nasg_w'):
+                        nasg_g_sum += block._last_nasg_w.mean().item()
+                    if hasattr(block, '_last_state_gate'):
+                        sg = block._last_state_gate.mean(dim=0).cpu()
+                        if state_gate_sum is None:
+                            state_gate_sum = sg
+                        else:
+                            state_gate_sum = state_gate_sum + sg
+                n_samples += 1
+
+                # CNN forward
+                if cnn_model is not None and mel_fb is not None:
+                    noisy_mel = _compute_mel_batch(noisy_audio, 512, 160, mel_fb, device)
+                    _ = cnn_model(noisy_mel)
+                    cnn_y_var += _get_cnn_output_var(cnn_model)
+
+            denom = max(n_samples * n_blocks, 1)
+            ssm_y_var /= denom
+            ssm_amp = ssm_y_var / max(ssm_clean_var, 1e-12)
+            nasg_g = nasg_g_sum / denom
+
+            # State gate stats
+            if state_gate_sum is not None:
+                sg_avg = state_gate_sum / denom
+                m_0 = sg_avg[0].item()
+                m_last = sg_avg[-1].item()
+                n_eff = sg_avg.sum().item()
+                sg_str = f"{m_0:6.3f} {m_last:6.3f} {n_eff:5.1f}"
+            else:
+                sg_str = "   N/A    N/A   N/A"
+
+            # Per-state h variance
+            if ssm_h_var_sum is not None:
+                h_avg = ssm_h_var_sum / denom
+                h_str = " ".join(f"{v:.4f}" for v in h_avg[:8])
+            else:
+                h_str = "N/A"
+
+            line = (f"  {noise_type:>8s} {snr_db:>4d}dB │ {ssm_y_var:12.6f} {ssm_amp:10.2f}×"
+                    f" │ {nasg_g:8.4f} {sg_str}"
+                    f" │ {h_str}")
+
+            if cnn_model is not None:
+                cnn_y_var /= max(n_samples, 1)
+                cnn_amp = cnn_y_var / max(cnn_clean_var, 1e-12)
+                line += f" │ {cnn_y_var:12.6f} {cnn_amp:10.2f}×"
+
+            print(line, flush=True)
+
+    # 3. Theoretical prediction check
+    print("\n  📐 Theory check (O(σ²) verification):")
+    print("     If NC-SSM achieves O(σ²): Amp.Ratio should scale ∝ noise_power")
+    print("     -15dB→-5dB (10dB diff): ratio should decrease by ~10× (10 dB)")
+    print("     If Amp.Ratio >> 10×: residual selectivity causing O(σ⁶) leakage")
+    print("     NASG g ≈ 0.001 at -15dB → good (pure LTI)")
+    print("     NASG g > 0.05 at -15dB → bad (selectivity leaking noise)")
+    print("=" * 80 + "\n")
+
+
+def _get_ssm_blocks(model):
+    """Extract SSM (sa_ssm) submodules from NanoMambaBlock for diagnostic access.
+
+    NanoMamba architecture: model.blocks[i] = NanoMambaBlock, which contains
+    NanoMambaBlock.sa_ssm = SpectralAwareSSM / NoiseCondSMSSM / etc.
+    The SSM submodule caches _last_y_var, _last_h_var, _last_nasg_w, _last_state_gate.
+    """
+    blocks = []
+    if hasattr(model, 'blocks'):
+        for block in model.blocks:
+            # NanoMambaBlock.sa_ssm is the actual SSM
+            if hasattr(block, 'sa_ssm'):
+                ssm = block.sa_ssm
+                if hasattr(ssm, '_last_y_var'):
+                    blocks.append(ssm)
+            # Fallback: block is the SSM itself
+            elif hasattr(block, '_last_y_var'):
+                blocks.append(block)
+    return blocks
+
+
+def _get_cnn_output_var(cnn_model):
+    """Get output variance from CNN model's last layer output.
+
+    CNN models don't cache internal states, so we hook into the classifier.
+    Returns variance of the final feature map before classification.
+    """
+    # Most CNN models have a final feature extraction that we can approximate
+    # For now, return 0 — to be populated when CNN model architecture is confirmed
+    if hasattr(cnn_model, '_last_feature_var'):
+        return cnn_model._last_feature_var
+    return 0.0
 
 
 @torch.no_grad()
@@ -1445,18 +2129,18 @@ def run_noise_evaluation(models_dict, val_loader, device,
                          dataset_audios=None, use_enhancer=False,
                          enhancer_type='spectral', gtcrn_model=None,
                          enhancer_bypass=False, bypass_threshold=-2.0,
-                         bypass_scale=3.0,
+                         bypass_scale=3.0, sf_range=2.0,
                          ss_version='v2', bypass_version='v2'):
     if noise_types is None:
         noise_types = ['factory', 'white', 'babble', 'street', 'pink']
     if snr_levels is None:
-        snr_levels = [-15, -10, -5, 0, 5, 10, 15, 'clean']
+        snr_levels = [-25, -20, -15, -10, -5, 0, 5, 10, 15, 'clean']
 
     enhancer_names = {'spectral': 'SPECTRAL SUBTRACTION (0 params)',
                       'gtcrn': 'GTCRN PRE-TRAINED (23.7K params)'}
     bypass_str = " + SNR-ADAPTIVE BYPASS" if enhancer_bypass else ""
     version_str = ""
-    if ss_version == 'v2' or bypass_version == 'v2':
+    if ss_version in ('v2', 'v3') or bypass_version == 'v2':
         version_str = f" [SS:{ss_version}, Bypass:{bypass_version}]"
     enhancer_str = f" [WITH {enhancer_names.get(enhancer_type, enhancer_type)}{bypass_str}{version_str}]" if use_enhancer else ""
     print("\n" + "=" * 80)
@@ -1465,7 +2149,9 @@ def run_noise_evaluation(models_dict, val_loader, device,
     print(f"  SNR levels: {snr_levels}")
     if enhancer_bypass:
         print(f"  Bypass: threshold={bypass_threshold}dB, scale={bypass_scale}")
-        if ss_version == 'v2':
+        if ss_version == 'v3':
+            print(f"  SS v3: Wiener gain + aggressive (alpha 1.0-5.0) + low floor (5%/1%)")
+        elif ss_version == 'v2':
             print(f"  SS v2: adaptive oversubtract + freq-weighted floor + running noise est")
         if bypass_version == 'v2':
             print(f"  Bypass v2: noise-type-aware threshold (SF-adaptive)")
@@ -1505,6 +2191,7 @@ def run_noise_evaluation(models_dict, val_loader, device,
                         enhancer_bypass=enhancer_bypass,
                         bypass_threshold=bypass_threshold,
                         bypass_scale=bypass_scale,
+                        sf_range=sf_range,
                         ss_version=ss_version,
                         bypass_version=bypass_version,
                         is_cnn=is_cnn,
@@ -2301,6 +2988,7 @@ def run_calibrated_evaluation(models_dict, val_loader, device,
                               use_enhancer=False, enhancer_type='spectral',
                               gtcrn_model=None, enhancer_bypass=False,
                               bypass_threshold=-2.0, bypass_scale=3.0,
+                              sf_range=2.0,
                               ss_version='v2', bypass_version='v2',
                               use_continuous_calibration=False):
     """Evaluate with Runtime Parameter Calibration.
@@ -2311,7 +2999,7 @@ def run_calibrated_evaluation(models_dict, val_loader, device,
     if noise_types is None:
         noise_types = ['factory', 'white', 'babble', 'street', 'pink']
     if snr_levels is None:
-        snr_levels = [-15, -10, -5, 0, 5, 10, 15, 'clean']
+        snr_levels = [-25, -20, -15, -10, -5, 0, 5, 10, 15, 'clean']
 
     cal_mode = "CONTINUOUS" if use_continuous_calibration else "DISCRETE"
     print("\n" + "=" * 80)
@@ -2369,6 +3057,7 @@ def run_calibrated_evaluation(models_dict, val_loader, device,
                         enhancer_bypass=enhancer_bypass,
                         bypass_threshold=bypass_threshold,
                         bypass_scale=bypass_scale,
+                        sf_range=sf_range,
                         ss_version=ss_version,
                         bypass_version=bypass_version,
                         is_cnn=is_cnn, mel_fb=mel_fb)
@@ -2729,7 +3418,21 @@ MODEL_REGISTRY = {
     'SAGN': create_sagn,
     # NC-SSM: Noise-Conditioned SM-SSM (per-sub-band selectivity + LSG)
     'NanoMamba-NC-Matched': create_nanomamba_nc_matched,
+    'NC-SSM': create_nanomamba_nc_matched,  # paper name alias
     'NanoMamba-NC-Large': create_nanomamba_nc_large,
+    'NanoMamba-NC-Large-PD': lambda n=12: create_nanomamba_nc_large(n, use_param_decouple=True),
+    'NanoMamba-NC-Large-NASG': lambda n=12: create_nanomamba_nc_large(n, use_nasg=True),
+    # NC-SSM + NanoSE: Sequential Enhancement Expert for extreme low-SNR KWS
+    'NanoMamba-NC-NanoSE': create_nanomamba_nc_nanose,
+    'NanoMamba-NC-NanoSE-v3': create_nanomamba_nc_nanose_v3,
+    'NanoMamba-NC-Matched-NanoSE': create_nanomamba_nc_matched_nanose,
+    # NC-SSM Parameter Scaling Study
+    'NanoMamba-NC-12K': create_nanomamba_nc_12k,
+    'NanoMamba-NC-15K': create_nanomamba_nc_15k,
+    'NanoMamba-NC-20K': create_nanomamba_nc_20k,
+    'NanoMamba-NC-20K-SS': create_nanomamba_nc_20k_ss,
+    'NanoMamba-NC-15K-SS': create_nanomamba_nc_15k_ss,
+    'NanoMamba-NC-12K-SS': create_nanomamba_nc_12k_ss,
     'DS-CNN-S': lambda n=12: DSCNN_S(n_classes=n),
     'BC-ResNet-1': lambda n=12: BCResNet(n_classes=n, scale=1),
 }
@@ -2794,7 +3497,8 @@ def train_model(model, model_name, train_dataset, val_dataset,
                 checkpoint_dir, device, epochs=30, batch_size=128, lr=3e-3,
                 noise_aug=False, noise_ratio=0.5, noise_curriculum_v2=False,
                 ss_train=False,
-                use_ema=False, ema_decay=0.999):
+                use_ema=False, ema_decay=0.999, low_snr_boost=False,
+                hard_epochs=0):
     """Full training loop with Per-Sample Multi-Condition Noise Augmentation.
 
     [NOVEL] Per-Sample Multi-Condition Training reveals structural differences:
@@ -2895,7 +3599,7 @@ def train_model(model, model_name, train_dataset, val_dataset,
             else:
                 _adjust_bn_momentum(model, 0.05)  # Slower during noise-aug
 
-        train_loss, train_acc = train_one_epoch(
+        train_loss, train_acc, sf_loss_avg, snr_stats = train_one_epoch(
             model, train_loader, optimizer, scheduler, device,
             epoch=epoch, model_name=model_name,
             noise_aug=noise_aug, noise_ratio=noise_ratio,
@@ -2903,7 +3607,9 @@ def train_model(model, model_name, train_dataset, val_dataset,
             mel_fb=mel_fb, total_epochs=epochs,
             noise_curriculum_v2=noise_curriculum_v2,
             ss_train=ss_train,
-            ema=ema)
+            ema=ema,
+            low_snr_boost=low_snr_boost,
+            hard_epochs=hard_epochs)
 
         # Evaluate on CLEAN val set (always clean, fair comparison)
         # Use EMA weights for evaluation if enabled
@@ -2928,6 +3634,39 @@ def train_model(model, model_name, train_dataset, val_dataset,
               f"Val: {val_acc:.1f}% | "
               f"Time: {elapsed:.1f}s{marker}", flush=True)
 
+        # NASG Training Monitor: SF bridge + gate response per epoch
+        if not is_cnn and hasattr(model, 'sf_to_snr_scale'):
+            import math as _m
+            _sc = model.sf_to_snr_scale.item()
+            _bi = model.sf_to_snr_bias.item()
+            _ns = model.blocks[0].sa_ssm.nasg_scale.item()
+            _nb = model.blocks[0].sa_ssm.nasg_bias.item()
+            _hints = [('Clean', 0.987), ('-5dB', _m.tanh(-5/10)), ('-15dB', _m.tanh(-15/10))]
+            # Correct formula: sigmoid(nasg_scale * hint + nasg_bias)
+            _gs = " ".join(f"{l}:{1/(1+_m.exp(-(_ns*h+_nb))):.3f}" for l, h in _hints)
+            _snr_str = ""
+            if snr_stats is not None:
+                _smin, _smean, _smax, _scnt = snr_stats
+                _snr_str = f" SNR({_smin:.0f}~{_smax:.0f}dB,avg={_smean:.1f},n={_scnt})"
+            print(f"    📊 SF(scale={_sc:.2f},bias={_bi:.2f}) "
+                  f"NASG(scale={_ns:.2f},bias={_nb:.2f}) "
+                  f"SF-loss={sf_loss_avg:.4f} "
+                  f"g[{_gs}]{_snr_str}", flush=True)
+
+        # ★ Periodic noise propagation diagnostic (every 5 epochs during noise-aug)
+        # Checks that NASG, state masking, and O(σ²) bound work as intended.
+        if (not is_cnn and noise_aug and
+                (epoch + 1) % 5 == 0 and epoch >= 3):
+            try:
+                diagnose_noise_propagation(
+                    model, val_loader, device,
+                    dataset_audios=dataset_audios,
+                    noise_types=('white', 'factory'),
+                    snr_dbs=(-15, -5, 5),
+                    max_batches=3)
+            except Exception as e:
+                print(f"    ⚠ Noise diagnostic failed: {e}", flush=True)
+
         if val_acc > best_acc:
             best_acc = val_acc
             best_epoch = epoch + 1
@@ -2940,6 +3679,42 @@ def train_model(model, model_name, train_dataset, val_dataset,
                 'noise_aug': noise_aug,
                 'use_ema': use_ema,
             }, model_dir / 'best.pt')
+            # Auto-backup to Google Drive if available
+            try:
+                drive_backup = Path('/content/drive/MyDrive/NC-SSM-checkpoints') / model_name.replace(' ', '_')
+                drive_backup.mkdir(parents=True, exist_ok=True)
+                import shutil
+                shutil.copy2(model_dir / 'best.pt', drive_backup / 'best.pt')
+                print(f"    💾 Drive backup: {drive_backup / 'best.pt'}", flush=True)
+            except Exception:
+                pass  # Not on Colab or Drive not mounted
+
+        # Also track best during HARD phase (epoch 20+) separately
+        # HARD phase models have seen extreme noise → better noise robustness
+        if noise_curriculum_v2 and epoch >= 20:
+            if not hasattr(main, '_hard_best'):
+                main._hard_best = {}
+            hard_key = model_name
+            hard_prev = main._hard_best.get(hard_key, 0)
+            if val_acc > hard_prev:
+                main._hard_best[hard_key] = val_acc
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'epoch': epoch,
+                    'val_acc': val_acc,
+                    'model_name': model_name,
+                    'noise_aug': noise_aug,
+                    'use_ema': use_ema,
+                    'phase': 'hard',
+                }, model_dir / 'best_hard.pt')
+                print(f"    🔥 HARD-phase best: {val_acc:.2f}% @ epoch {epoch+1}", flush=True)
+                try:
+                    drive_backup = Path('/content/drive/MyDrive/NC-SSM-checkpoints') / model_name.replace(' ', '_')
+                    drive_backup.mkdir(parents=True, exist_ok=True)
+                    import shutil
+                    shutil.copy2(model_dir / 'best_hard.pt', drive_backup / 'best_hard.pt')
+                except Exception:
+                    pass
 
         # Restore original weights for continued training
         if ema is not None:
@@ -2963,10 +3738,18 @@ def train_model(model, model_name, train_dataset, val_dataset,
         json.dump(history, f, indent=2)
 
     print(f"\n  Best: {best_acc:.2f}% @ epoch {best_epoch}")
+    hard_pt = model_dir / 'best_hard.pt'
+    if hard_pt.exists():
+        hard_ckpt = torch.load(hard_pt, map_location=device)
+        print(f"  Best (HARD phase): {hard_ckpt['val_acc']:.2f}% @ epoch {hard_ckpt['epoch']+1}")
     print(f"  Saved to {model_dir}")
 
-    # Load best checkpoint
-    ckpt = torch.load(model_dir / 'best.pt', map_location=device)
+    # Load best_hard if available (better noise robustness), else best
+    if hard_pt.exists():
+        ckpt = torch.load(hard_pt, map_location=device)
+        print(f"  → Using HARD-phase checkpoint for evaluation (better noise robustness)")
+    else:
+        ckpt = torch.load(model_dir / 'best.pt', map_location=device)
     model.load_state_dict(ckpt['model_state_dict'], strict=False)
 
     return best_acc, model
@@ -2995,6 +3778,10 @@ def _evaluate_cnn(model, val_loader, device):
 def main():
     parser = argparse.ArgumentParser(
         description="NanoMamba Colab Training — Structural Noise Robustness")
+    parser.add_argument('--dataset', type=str, default='gsc',
+                        choices=['gsc', 'fsc'],
+                        help='Dataset: gsc (Google Speech Commands 12-class) '
+                             'or fsc (Fluent Speech Commands 31-class intent)')
     parser.add_argument('--data_dir', type=str, default='./data',
                         help='Dataset root directory')
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints',
@@ -3006,6 +3793,9 @@ def main():
     parser.add_argument('--lr', type=float, default=3e-3)
     parser.add_argument('--eval_only', action='store_true',
                         help='Only run noise evaluation (load checkpoints)')
+    parser.add_argument('--profile', action='store_true',
+                        help='Profile models: compute MACs, memory, latency, '
+                             'and deployment metrics. No training needed.')
     parser.add_argument('--models', type=str,
                         default='NanoMamba-Tiny',
                         help='Comma-separated model names')
@@ -3034,8 +3824,8 @@ def main():
     parser.add_argument('--sf_range', type=float, default=2.0,
                         help='Spectral flatness adaptive range for bypass (default: 2.0)')
     parser.add_argument('--ss_version', type=str, default='v2',
-                        choices=['v1', 'v2'],
-                        help='SS version: v1 (fixed oversubtract) or v2 (adaptive)')
+                        choices=['v1', 'v2', 'v3'],
+                        help='SS version: v1 (fixed), v2 (adaptive), v3 (Wiener gain aggressive)')
     parser.add_argument('--bypass_version', type=str, default='v2',
                         choices=['v1', 'v2'],
                         help='Bypass version: v1 (fixed threshold) or v2 (noise-aware)')
@@ -3058,6 +3848,15 @@ def main():
                         help='Use v2 noise curriculum: type-staged introduction '
                              '(stationary first, then non-stationary) + '
                              'SNR annealing (Gaussian centered at difficulty frontier)')
+    parser.add_argument('--low_snr_boost', action='store_true',
+                        help='Boost low-SNR training: start hard phase earlier (epoch 15) '
+                             'and use more aggressive SNR range (-15~5dB) in hard phase. '
+                             'Use with --noise_curriculum_v2.')
+    parser.add_argument('--hard_epochs', type=int, default=0,
+                        help='Number of epochs for HARD phase. 0 = use default '
+                             '(10 epochs or 15 with --low_snr_boost). '
+                             'With NanoSE, 5 may suffice since enhancement handles '
+                             'extreme noise.')
     parser.add_argument('--ss_train', action='store_true',
                         help='Apply Spectral Subtraction (SS v2) to noisy audio '
                              'DURING training. Model learns to exploit SS-enhanced '
@@ -3082,28 +3881,81 @@ def main():
     np.random.seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\n{'='*80}")
+    dataset_label = 'FSC (31-class intent)' if args.dataset == 'fsc' else 'GSC (12-class KWS)'
     print(f"  NanoMamba Training — Structural Noise Robustness")
     print(f"  Device: {device}")
+    print(f"  Dataset: {dataset_label}")
     print(f"  Models: {args.models}")
     print(f"  Epochs: {args.epochs}, LR: {args.lr}, Batch: {args.batch_size}")
     print(f"  Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*80}")
 
+    # ===== 0. Profile mode (no dataset needed) =====
+    n_classes_profile = 31 if args.dataset == 'fsc' else 12
+    if args.profile:
+        print("\n  === MODEL PROFILING MODE ===\n")
+        model_names = [m.strip() for m in args.models.split(',')]
+
+        if 'all' in model_names:
+            # Profile all primary models with comparison table
+            profile_all_models(verbose=True)
+        else:
+            # Profile specified models
+            for name in model_names:
+                model = create_model(name, n_classes=n_classes_profile)
+                model.eval()
+                result = profile_model(model, verbose=True)
+
+            # If multiple models, print comparison
+            if len(model_names) > 1:
+                print(f"\n{'='*75}")
+                print(f"  COMPARISON TABLE")
+                print(f"{'='*75}")
+                print(f"  {'Model':<28} {'Params':>8} {'MACs(M)':>8} "
+                      f"{'Lat(ms)':>8} {'RAM(KB)':>9}")
+                print(f"  {'-'*65}")
+                for name in model_names:
+                    model = create_model(name, n_classes=n_classes_profile)
+                    model.eval()
+                    r = profile_model(model, verbose=False)
+                    d = r['deployment']
+                    m = r['memory']
+                    print(f"  {name:<28} {m['params']:>8,} "
+                          f"{d['macs_M']:>8.2f} {d['latency_ms']:>8.2f} "
+                          f"{d['total_ram_kb']:>9.1f}")
+                print(f"{'='*75}\n")
+        sys.exit(0)
+
     # ===== 1. Load dataset =====
-    print("\n  Loading Google Speech Commands V2...")
     os.makedirs(args.data_dir, exist_ok=True)
 
-    train_dataset = SpeechCommandsDataset(
-        args.data_dir, subset='training', augment=True)
-    val_dataset = SpeechCommandsDataset(
-        args.data_dir, subset='validation', augment=False)
-    test_dataset = SpeechCommandsDataset(
-        args.data_dir, subset='testing', augment=False)
+    if args.dataset == 'fsc':
+        print("\n  Loading Fluent Speech Commands (31-class intent)...")
+        fsc_root = _download_fsc(args.data_dir)
+        n_classes = 31
+        train_dataset = FluentSpeechCommandsDataset(
+            fsc_root, subset='training', augment=True)
+        val_dataset = FluentSpeechCommandsDataset(
+            fsc_root, subset='validation', augment=False)
+        test_dataset = FluentSpeechCommandsDataset(
+            fsc_root, subset='testing', augment=False)
+    else:
+        print("\n  Loading Google Speech Commands V2...")
+        n_classes = 12
+        train_dataset = SpeechCommandsDataset(
+            args.data_dir, subset='training', augment=True)
+        val_dataset = SpeechCommandsDataset(
+            args.data_dir, subset='validation', augment=False)
+        test_dataset = SpeechCommandsDataset(
+            args.data_dir, subset='testing', augment=False)
 
-    print(f"\n  Train: {len(train_dataset)}, Val: {len(val_dataset)}, "
+    print(f"\n  Dataset: {args.dataset.upper()}, Classes: {n_classes}")
+    print(f"  Train: {len(train_dataset)}, Val: {len(val_dataset)}, "
           f"Test: {len(test_dataset)}")
 
     # Optional RAM caching for val set
@@ -3117,7 +3969,7 @@ def main():
     model_names = [m.strip() for m in args.models.split(',')]
     models = {}
     for name in model_names:
-        model = create_model(name)
+        model = create_model(name, n_classes=n_classes)
         # Enable SpecAugment if requested (works with any NanoMamba model)
         if args.spec_augment and hasattr(model, 'use_spec_augment'):
             model.use_spec_augment = True
@@ -3156,7 +4008,9 @@ def main():
                 noise_aug=args.noise_aug, noise_ratio=args.noise_ratio,
                 noise_curriculum_v2=args.noise_curriculum_v2,
                 ss_train=args.ss_train,
-                use_ema=args.use_ema, ema_decay=args.ema_decay)
+                use_ema=args.use_ema, ema_decay=args.ema_decay,
+                low_snr_boost=getattr(args, 'low_snr_boost', False),
+                hard_epochs=getattr(args, 'hard_epochs', 0))
 
         trained_models[model_name] = model
 
@@ -3193,6 +4047,11 @@ def main():
     snr_levels = [int(s.strip()) for s in args.snr_range.split(',')]
     snr_levels.append('clean')
 
+    # Collect audio samples for babble noise generation during eval
+    dataset_audios = None
+    if hasattr(train_dataset, '_cache_audio'):
+        dataset_audios = train_dataset._cache_audio[:500]
+
     # Load GTCRN enhancer if requested
     gtcrn_model = None
     if args.use_enhancer and args.enhancer_type == 'gtcrn':
@@ -3206,12 +4065,14 @@ def main():
     noise_results = run_noise_evaluation(
         trained_models, val_loader, device,
         noise_types=noise_types, snr_levels=snr_levels,
+        dataset_audios=dataset_audios,
         use_enhancer=args.use_enhancer,
         enhancer_type=args.enhancer_type,
         gtcrn_model=gtcrn_model,
         enhancer_bypass=args.enhancer_bypass,
         bypass_threshold=args.bypass_threshold,
         bypass_scale=args.bypass_scale,
+        sf_range=args.sf_range,
         ss_version=args.ss_version,
         bypass_version=args.bypass_version)
 
@@ -3221,12 +4082,14 @@ def main():
         calibrated_results = run_calibrated_evaluation(
             trained_models, val_loader, device,
             noise_types=noise_types, snr_levels=snr_levels,
+            dataset_audios=dataset_audios,
             use_enhancer=args.use_enhancer,
             enhancer_type=args.enhancer_type,
             gtcrn_model=gtcrn_model,
             enhancer_bypass=args.enhancer_bypass,
             bypass_threshold=args.bypass_threshold,
             bypass_scale=args.bypass_scale,
+            sf_range=args.sf_range,
             ss_version=args.ss_version,
             bypass_version=args.bypass_version,
             use_continuous_calibration=getattr(args, 'calibrate_continuous', False))
@@ -3240,6 +4103,7 @@ def main():
             rt60_list=rt60_list,
             noise_types_reverb=[t for t in noise_types if t in ['factory', 'babble']],
             snr_levels_reverb=[0, 5],
+            dataset_audios=dataset_audios,
             use_enhancer=args.use_enhancer,
             enhancer_type=args.enhancer_type,
             gtcrn_model=gtcrn_model)
