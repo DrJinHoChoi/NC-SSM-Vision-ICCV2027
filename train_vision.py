@@ -42,7 +42,9 @@ from ncssm_vision_tasks import (
     LaneDetectionLoss, CriticalObjectLoss,
     LaneHead, CriticalObjectHead,
     create_lane_detector_nano, create_lane_detector_tiny,
+    create_lane_detector_small, create_lane_detector_medium,
     create_critical_detector_nano, create_critical_detector_tiny,
+    create_critical_detector_small,
     create_multitask_detector_tiny,
 )
 

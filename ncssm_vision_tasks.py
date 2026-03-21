@@ -424,13 +424,13 @@ class NanoMambaLaneDetector(nn.Module):
 
     def __init__(self, img_size=288, patch_size=16, n_lanes=4,
                  n_anchors=18, n_grids=100,
-                 d_model=24, d_state=6, n_repeats=4, **kwargs):
+                 d_model=24, d_state=6, n_repeats=4, expand=1.0, **kwargs):
         super().__init__()
 
         self.backbone = NanoMambaVision(
             img_size=img_size, patch_size=patch_size, in_chans=3,
             n_classes=1,  # dummy, not used
-            d_model=d_model, d_state=d_state, d_conv=3, expand=1.0,
+            d_model=d_model, d_state=d_state, d_conv=3, expand=expand,
             n_layers=1, n_repeats=n_repeats, weight_sharing=True,
             use_dual_norm=True, use_retinex=True, use_nc_ssm=True,
             **kwargs)
@@ -490,7 +490,7 @@ class NanoMambaCriticalDetector(nn.Module):
     ]
 
     def __init__(self, img_size=288, patch_size=16, n_classes=5,
-                 d_model=24, d_state=6, n_repeats=4, **kwargs):
+                 d_model=24, d_state=6, n_repeats=4, expand=1.0, **kwargs):
         super().__init__()
 
         n_patches_h = img_size // patch_size
@@ -499,7 +499,7 @@ class NanoMambaCriticalDetector(nn.Module):
         self.backbone = NanoMambaVision(
             img_size=img_size, patch_size=patch_size, in_chans=3,
             n_classes=1,
-            d_model=d_model, d_state=d_state, d_conv=3, expand=1.0,
+            d_model=d_model, d_state=d_state, d_conv=3, expand=expand,
             n_layers=1, n_repeats=n_repeats, weight_sharing=True,
             use_dual_norm=True, use_retinex=True, use_nc_ssm=True,
             **kwargs)
@@ -636,6 +636,22 @@ def create_lane_detector_tiny(img_size=192, n_lanes=4, **kwargs):
         d_model=24, d_state=6, n_repeats=4, **kwargs)
 
 
+def create_lane_detector_small(img_size=192, n_lanes=4, **kwargs):
+    """Small lane detector: ~100K params. d=64, 144 patches, accuracy-first."""
+    return NanoMambaLaneDetector(
+        img_size=img_size, patch_size=16, n_lanes=n_lanes,
+        n_anchors=18, n_grids=100,
+        d_model=64, d_state=16, n_repeats=6, **kwargs)
+
+
+def create_lane_detector_medium(img_size=192, n_lanes=4, **kwargs):
+    """Medium lane detector: ~200K params. d=96, maximum accuracy."""
+    return NanoMambaLaneDetector(
+        img_size=img_size, patch_size=16, n_lanes=n_lanes,
+        n_anchors=18, n_grids=100,
+        d_model=96, d_state=16, n_repeats=8, **kwargs)
+
+
 def create_critical_detector_nano(img_size=192, n_classes=5, **kwargs):
     """Nano critical object detector: ~15K params."""
     return NanoMambaCriticalDetector(
@@ -648,6 +664,13 @@ def create_critical_detector_tiny(img_size=192, n_classes=5, **kwargs):
     return NanoMambaCriticalDetector(
         img_size=img_size, patch_size=32, n_classes=n_classes,
         d_model=24, d_state=6, n_repeats=4, **kwargs)
+
+
+def create_critical_detector_small(img_size=192, n_classes=5, **kwargs):
+    """Small critical object detector: ~100K params."""
+    return NanoMambaCriticalDetector(
+        img_size=img_size, patch_size=16, n_classes=n_classes,
+        d_model=64, d_state=16, n_repeats=6, **kwargs)
 
 
 def create_multitask_detector_tiny(img_size=192, **kwargs):
