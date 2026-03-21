@@ -46,3 +46,22 @@ training_output.log
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Vision training temp files
+checkpoints_vision/
+ir_deck.js
+nul
+_verify_v2fix.py
+*.docx
+
+# Generated images (keep paper figures)
+babble_comparison.png
+baseline_comparison.png
+calibration_detail.png
+final_performance_summary.png
+pcen_noise_comparison.png
+noise_analysis_paper.pdf
+noise_analysis_paper.png
+
+# Claude
+.claude/
