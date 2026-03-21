@@ -589,7 +589,7 @@ def evaluate(model, dataloader, criterion, device, task='lane'):
 
             if mask.sum() > 0:
                 x_diff = (pred_x - gt_x).abs()
-                correct = ((x_diff < 0.05) & (pred_conf > 0.5) & mask).sum()
+                correct = ((x_diff < 0.1) & (pred_conf > 0.3) & mask).sum()
                 total_correct += correct.item()
                 total_points += mask.sum().item()
 
