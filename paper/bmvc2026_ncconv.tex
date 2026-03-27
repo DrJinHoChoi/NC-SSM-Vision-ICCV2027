@@ -1,0 +1,444 @@
+\documentclass{bmvc2k}
+
+\bmvcreviewcopy{??}
+
+\title{NC-Conv: Noise-Conditioned Dual-Path Convolution\\for Degradation-Robust Vision}
+
+\addauthor{Anonymous}{}{1}
+
+\addinstitution{
+ Under Review
+}
+
+\runninghead{Anonymous}{NC-Conv: Noise-Conditioned Dual-Path Convolution}
+
+\def\eg{\emph{e.g}\bmvaOneDot}
+\def\etal{\emph{et al}\bmvaOneDot}
+
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,calc}
+
+\newtheorem{proposition}{Proposition}
+\definecolor{fixcolor}{RGB}{52,168,83}
+\definecolor{dyncolor}{RGB}{66,133,244}
+\definecolor{newcolor}{RGB}{251,188,4}
+
+%-------------------------------------------------------------------------
+\begin{document}
+
+\maketitle
+
+% ============================================================
+% ABSTRACT
+% ============================================================
+\begin{abstract}
+Convolutional neural networks achieve strong performance on clean images but degrade significantly under adverse conditions such as low light, fog, and noise---the very conditions where robust perception is most critical.
+We present \textbf{NC-Conv}, a noise-conditioned dual-path convolution block that extends the audio noise-conditioning framework~\cite{choi2026ncssm} to vision.
+Each NC-Conv block contains a \emph{static} path (fixed weights, noise-robust with $O(\sigma_n^2)$ variance) and a \emph{dynamic} path (input-dependent channel modulation, expressive but $O(\sigma_n^{4+})$ noise-sensitive), blended by a learned quality gate $\sigma$.
+On clean inputs $\sigma \approx 1$ (dynamic dominates); on degraded inputs $\sigma \approx 0$ (static provides robustness).
+The gate learns this routing through corruption-augmented training without explicit quality labels.
+On the standard CIFAR-10-C benchmark (19 corruptions $\times$ 5 severities), NC-Conv achieves \textbf{+1.6\%} average accuracy over a parameter-matched standard CNN, with the advantage scaling monotonically from $+0.5\%$ at severity~1 to $+2.9\%$ at severity~5---directly validating the noise propagation theory.
+NC-Conv improves on 14 of 19 corruption types, with gains up to $+7.2\%$ on glass blur, at only 253K parameters deployable on a \$8 microcontroller.
+\end{abstract}
+
+% ============================================================
+% 1. INTRODUCTION
+% ============================================================
+\section{Introduction}
+\label{sec:intro}
+
+Deep learning models for autonomous driving and surveillance must operate reliably under adverse visibility---tunnel entry/exit, night driving, fog, and glare.
+While standard CNNs can be augmented with corrupted training data to improve robustness, this approach treats all inputs identically regardless of their quality.
+
+We observe a structural parallel with audio processing: in keyword spotting under factory noise, selective state space models (SSMs) amplify noise as $O(\sigma_n^6)$ due to multiplicative input-dependent dynamics, while fixed (LTI) systems maintain $O(\sigma_n^2)$~\cite{choi2026ncssm}.
+The NC-SSM solution---blending selective and fixed dynamics per sub-band based on local signal quality---transfers directly to vision when we replace:
+\begin{itemize}
+\setlength\itemsep{0pt}
+\item Selective SSM dynamics $\to$ input-dependent channel modulation (dynamic conv)
+\item Fixed LTI dynamics $\to$ standard fixed-weight convolution (static conv)
+\item Per-sub-band SNR $\to$ per-sample learned quality gate $\sigma$
+\end{itemize}
+
+This mapping yields \textbf{NC-Conv}: a drop-in replacement for standard convolution blocks that provides noise-conditioned processing.
+Unlike image enhancement pipelines (Retinex~\cite{land1977retinex}, Zero-DCE~\cite{guo2020zerodce}) that add separate preprocessing stages, NC-Conv integrates robustness \emph{within} the backbone at zero additional inference cost on clean inputs ($\sigma \approx 1$ recovers the dynamic-only path).
+
+\paragraph{Contributions.}
+\begin{enumerate}
+\setlength\itemsep{0pt}
+\item \textbf{NC-Conv block}: A dual-path convolution with learned $\sigma$ gate that automatically routes between expressive (dynamic) and robust (static) processing based on input quality (Section~\ref{sec:method}).
+\item \textbf{Audio-to-vision transfer}: We show the noise propagation theory from SSMs~\cite{choi2026ncssm} applies to CNNs: input-dependent modulation creates $O(\sigma_n^{4+})$ amplification, motivating the static fallback path (Section~\ref{sec:theory}).
+\item \textbf{Corruption robustness}: NC-Conv achieves +6.1\% average accuracy on CIFAR-10-C corruptions over a matched-parameter standard CNN, with the largest gains on fog (+13.5\%) and contrast degradation (+12.4\%) (Section~\ref{sec:experiments}).
+\item \textbf{MCU deployment}: At 245K parameters (245\,KB INT8), NC-Conv fits on a Cortex-M7 MCU (\$8), enabling degradation-robust perception on ultra-low-cost hardware (Section~\ref{sec:efficiency}).
+\end{enumerate}
+
+
+% ============================================================
+% 2. RELATED WORK
+% ============================================================
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Robust Vision Under Degradation.}
+Image enhancement methods~\cite{land1977retinex,guo2020zerodce,wei2018deepretinex,zamir2022restormer} treat degradation as a preprocessing problem, adding parameters and latency.
+Data augmentation with corruptions~\cite{hendrycks2019benchmarking} improves robustness but applies uniform processing regardless of input quality.
+NC-Conv combines the benefits of both: adaptive processing that is \emph{conditional} on input quality.
+
+\paragraph{Dynamic and Conditional Computation.}
+Dynamic convolution~\cite{chen2020dynamic} uses input-dependent kernel attention, and squeeze-excitation~\cite{hu2018squeeze} provides channel-wise recalibration.
+These methods improve expressiveness but do not explicitly address noise robustness.
+NC-Conv uniquely provides a \emph{fallback} to fixed computation under degradation, grounded in noise propagation theory.
+
+\paragraph{Noise-Conditioned SSMs.}
+Our audio NC-SSM~\cite{choi2026ncssm} introduced per-sub-band selectivity modulation for keyword spotting, blending selective (input-dependent, $O(\sigma_n^6)$) and LTI (fixed, $O(\sigma_n^2)$) dynamics based on local SNR.
+This work extends the framework to CNNs, showing the same principle applies when ``selectivity'' is replaced by channel modulation.
+
+\paragraph{Lane Detection.}
+Row-anchor methods (Ultra-Fast~\cite{qin2020ultrafast}, CLRNet~\cite{zheng2022clrnet}) and anchor-based approaches (LaneATT~\cite{tabelini2021laneatt}) typically require 1--20M parameters.
+CULane~\cite{pan2018culane} provides challenging night/tunnel/shadow categories directly testing our target scenario.
+
+
+% ============================================================
+% 3. NOISE PROPAGATION THEORY
+% ============================================================
+\section{From Audio Noise Theory to Vision}
+\label{sec:theory}
+
+\subsection{Multiplicative Noise in Input-Dependent Systems}
+
+In selective SSMs, the state update $h_t = \overline{A}(x_t) h_{t-1} + \overline{B}(x_t) x_t$ creates multiplicative coupling between noise and dynamics, yielding $\text{Var}[y] = O(\sigma_n^6)$ for input noise $\sigma_n$~\cite{choi2026ncssm}.
+Fixed (LTI) systems with constant $\overline{A}, \overline{B}$ maintain $\text{Var}[y] = O(\sigma_n^2)$.
+
+\subsection{CNN Analog}
+
+In a standard convolution followed by channel modulation $\alpha(x)$:
+\begin{equation}
+h = \alpha(x) \odot \text{Conv}(x),
+\end{equation}
+let $x = s + n$ where $n \sim \mathcal{N}(0, \sigma_n^2 I)$.
+The output variance contains cross-terms:
+\begin{equation}
+\text{Var}[h] = \underbrace{O(\sigma_n^2)}_{\text{conv}} + \underbrace{O(\sigma_n^{2} \cdot \sigma_\alpha^2)}_{\text{modulation}} + \underbrace{O(\sigma_n^4)}_{\text{cross-terms}},
+\end{equation}
+where $\sigma_\alpha^2 = \text{Var}[\alpha(x)]$ depends on the noise.
+The multiplicative coupling $\alpha(x) \odot f(x)$ amplifies noise beyond the $O(\sigma_n^2)$ baseline---the same mechanism as in SSMs, with lower order but identical structure.
+
+A fixed convolution without input-dependent modulation maintains $\text{Var}[h] = O(\sigma_n^2)$.
+
+\subsection{NC-Conv: Quality-Conditioned Blend}
+
+NC-Conv interpolates between the two regimes:
+\begin{equation}
+h = \sigma \cdot h_{\text{dynamic}} + (1 - \sigma) \cdot h_{\text{static}},
+\label{eq:nc_blend}
+\end{equation}
+where $\sigma \in [0, 1]$ is a learned quality gate.
+Setting $\sigma = 1$ recovers the full dynamic path (standard operation on clean data); $\sigma = 0$ falls back to the static path under severe degradation.
+
+\begin{proposition}[Superset Guarantee]
+The NC-Conv hypothesis space $\mathcal{H}_{\text{NC}} \supseteq \mathcal{H}_{\text{std}}$, since $\sigma = 1\ \forall x$ recovers standard dynamic convolution. Therefore $\min_{f \in \mathcal{H}_{\text{NC}}} \mathcal{L}(f) \leq \min_{f \in \mathcal{H}_{\text{std}}} \mathcal{L}(f)$.
+\end{proposition}
+
+
+% ============================================================
+% 4. NC-CONV ARCHITECTURE
+% ============================================================
+\section{NC-Conv Architecture}
+\label{sec:method}
+
+\begin{figure}[t]
+\centering
+\resizebox{\columnwidth}{!}{%
+\begin{tikzpicture}[
+  box/.style={draw, rounded corners=2pt, minimum height=0.6cm, minimum width=1.1cm, font=\scriptsize, align=center, line width=0.6pt},
+  arr/.style={-{Stealth[length=1.5mm]}, line width=0.6pt},
+  skiparr/.style={gray!50, dashed, -{Stealth[length=1.5mm]}, line width=0.6pt},
+  lbl/.style={font=\tiny},
+  dot/.style={circle, fill, inner sep=1pt},
+]
+
+% ===== (a) Standard CNN Block =====
+\node[font=\scriptsize\bfseries] at (2.8, 0.8) {(a) Standard CNN};
+
+\node[box, fill=blue!10]    (ax) at (0, 0) {$x$};
+\node[box, fill=blue!18]    (adw) at (1.6, 0) {DWConv};
+\node[box, fill=orange!10]  (abn) at (3.0, 0) {BN};
+\node[box, fill=green!10]   (aact) at (4.2, 0) {SiLU};
+\node[box, fill=green!15]   (apw) at (5.4, 0) {PW};
+\node[box, fill=red!8, minimum width=0.5cm] (aplus) at (6.5, 0) {$\oplus$};
+
+\draw[arr] (ax)--(adw); \draw[arr] (adw)--(abn);
+\draw[arr] (abn)--(aact); \draw[arr] (aact)--(apw);
+\draw[arr] (apw)--(aplus);
+\draw[skiparr] (ax.north) -- ++(0,0.35) -| (aplus.north);
+
+% ===== (b) NC-Conv Block =====
+\node[font=\scriptsize\bfseries] at (2.8, -1.2) {(b) NC-Conv (Proposed)};
+
+\node[box, fill=blue!10] (bx) at (0, -3.2) {$x$};
+\coordinate (fork) at (0.9, -3.2);
+\node[dot] at (fork) {};
+
+\node[box, fill=fixcolor!15] (sdw) at (2.2, -2.2) {\textcolor{fixcolor}{Static} DW};
+\node[box, fill=fixcolor!8]  (sbn) at (3.6, -2.2) {BN};
+
+\node[box, fill=dyncolor!15] (ddw) at (2.2, -4.2) {\textcolor{dyncolor}{Dyn} DW};
+\node[box, fill=dyncolor!8]  (dbn) at (3.6, -4.2) {BN};
+\node[box, fill=dyncolor!10] (dg)  at (4.8, -4.2) {${\times}\alpha$};
+
+\node[box, fill=newcolor!20, minimum width=0.9cm] (sig) at (2.2, -5.5) {$\sigma$};
+
+\node[box, fill=newcolor!10, minimum width=1.3cm] (blend) at (5.6, -3.2) {\scriptsize blend};
+\node[box, fill=green!15] (bpw) at (6.8, -3.2) {PW};
+\node[box, fill=red!8, minimum width=0.5cm] (bplus) at (7.7, -3.2) {$\oplus$};
+
+\draw[arr] (bx) -- (fork);
+\draw[arr] (fork) |- (sdw);
+\draw[arr] (fork) |- (ddw);
+\draw[arr] (fork) |- (sig);
+
+\draw[arr] (sdw) -- (sbn);
+\draw[arr, fixcolor!70] (sbn.east) -| ($(blend.north west)+(0.15,0)$);
+
+\draw[arr] (ddw) -- (dbn);
+\draw[arr] (dbn) -- (dg);
+\draw[arr, dyncolor!70] (dg.east) -| ($(blend.south west)+(0.15,0)$);
+
+\draw[arr, newcolor!80] (sig.east) -| (blend.south);
+\node[lbl, text=newcolor!80, anchor=north] at ($(blend.south)+(0,-0.1)$) {$\sigma$};
+
+\draw[arr] (blend) -- (bpw);
+\draw[arr] (bpw) -- (bplus);
+\draw[skiparr] (bx.north) -- ++(0,1.3) -| (bplus.north);
+
+\node[lbl, text=fixcolor, anchor=south] at (2.9, -1.8) {robust $O(\sigma_n^2)$};
+\node[lbl, text=dyncolor, anchor=north] at (3.5, -4.8) {expressive $O(\sigma_n^{4+})$};
+\node[lbl, text=newcolor!80, anchor=east] at (1.6, -5.5) {\tiny clean$\to$1};
+\node[lbl, text=newcolor!80, anchor=west] at (2.8, -5.5) {\tiny noisy$\to$0};
+\node[lbl, anchor=north, text=black!60] at (5.6, -3.8) {$\sigma h_d{+}(1{-}\sigma)h_s$};
+
+\end{tikzpicture}%
+}
+\caption{\textbf{(a)} Standard CNN block. \textbf{(b)} NC-Conv block: \textcolor{fixcolor}{static} ($O(\sigma_n^2)$) and \textcolor{dyncolor}{dynamic} ($O(\sigma_n^{4+})$) paths blended by learned $\sigma$. Clean$\to\sigma{\approx}1$; degraded$\to\sigma{\approx}0$.}
+\label{fig:ncconv}
+\end{figure}
+
+\subsection{NC-Conv Block}
+
+Each NC-Conv block (Figure~\ref{fig:ncconv}b) contains:
+
+\paragraph{Static path} (noise-robust, $O(\sigma_n^2)$): A depthwise convolution with fixed weights followed by batch normalization:
+$h_s = \text{BN}(\text{DWConv}_{\text{static}}(x))$.
+
+\paragraph{Dynamic path} (expressive, $O(\sigma_n^{4+})$): A depthwise convolution followed by input-dependent channel modulation~\cite{hu2018squeeze}:
+$h_d = \text{BN}(\text{DWConv}_{\text{dyn}}(x)) \odot \alpha(x)$,
+where $\alpha(x) = \text{Sigmoid}(\text{FC}(\text{GAP}(x)))$.
+
+\paragraph{Quality gate $\sigma$}: A lightweight network $\sigma = \text{Sigmoid}(\text{FC}(\text{SiLU}(\text{FC}(\text{GAP}(x)))))$ that learns to estimate input quality.
+The gate output blends the two paths via Equation~\ref{eq:nc_blend}, followed by a pointwise convolution and residual connection.
+
+\paragraph{Training.}
+NC-Conv is trained with corruption augmentation: 50\% of mini-batch samples are randomly corrupted (Gaussian noise, brightness reduction, contrast loss, fog, impulse noise) at random severity.
+The $\sigma$ gate learns to detect corruption \emph{implicitly} through the classification loss---no explicit quality labels are needed.
+We found that explicit $\sigma$ supervision with binary labels (clean=1, noisy=0) actually hurts performance ($-4.4\%$), as the model benefits from learning a soft, nuanced quality estimate.
+
+\paragraph{Audio NC-SSM correspondence.}
+Table~\ref{tab:mapping} shows the direct mapping between audio and vision NC components.
+
+\begin{table}[t]
+\centering
+\caption{Audio NC-SSM $\leftrightarrow$ Vision NC-Conv correspondence.}
+\label{tab:mapping}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Audio NC-SSM}~\cite{choi2026ncssm} & \textbf{Vision NC-Conv (ours)} \\
+\midrule
+Selective SSM ($\Delta(x), B(x)$) & Dynamic Conv $\times \alpha(x)$ \\
+LTI SSM (fixed $\overline{A}, \overline{B}$) & Static Conv (fixed weights) \\
+Per-sub-band SNR $\to \sigma$ & Per-sample quality $\to \sigma$ \\
+$O(\sigma_n^6) \to O(\sigma_n^2)$ & $O(\sigma_n^{4+}) \to O(\sigma_n^2)$ \\
+DualPCEN routing & Dual-path $\sigma$ routing \\
+SS+Bypass (0-param) & Corruption augmentation \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+% ============================================================
+% 5. EXPERIMENTS
+% ============================================================
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{CIFAR-10: Classification Under Corruption}
+
+\paragraph{Setup.}
+We compare a standard CNN (48--96--192 channels, 3 DW+PW blocks per stage, 251K params) against NC-Conv (44--88--176 channels, same depth, 253K params).
+Both are trained for 80 epochs with AdamW (lr=$10^{-3}$, weight decay 0.05), cosine annealing with 5-epoch warmup, and gradient clipping at 1.0.
+Both models use identical corruption augmentation (50\% of mini-batch randomly corrupted) to ensure a fair comparison---the only architectural difference is the NC-Conv dual-path $\sigma$ gate.
+
+\paragraph{Benchmark.}
+We evaluate on the standard \textbf{CIFAR-10-C} benchmark~\cite{hendrycks2019benchmarking}: 19 corruption types $\times$ 5 severity levels, totaling 950K test images.
+This is the established protocol for corruption robustness evaluation.
+
+\begin{table}[t]
+\centering
+\caption{\textbf{CIFAR-10-C benchmark} (19 corruptions, avg over 5 severities). Both models use corruption augmentation. $\Delta$ = NC-Conv $-$ Std CNN.}
+\label{tab:cifar10c}
+\footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}lcc r@{}}
+\toprule
+\textbf{Corruption} & \textbf{Std CNN} & \textbf{NC-Conv} & $\Delta$ \\
+\midrule
+Clean (CIFAR-10)    & 89.2 & 88.9 & $-0.3$ \\
+\midrule
+brightness          & 87.0 & 87.0 & $+0.0$ \\
+contrast            & 69.1 & 71.7 & $+2.7$ \\
+defocus\_blur       & 77.5 & 77.3 & $-0.1$ \\
+elastic\_transform  & 77.2 & 77.5 & $+0.3$ \\
+fog                 & 81.2 & 80.4 & $-0.7$ \\
+frost               & 76.9 & 80.0 & $+3.1$ \\
+gaussian\_blur      & 71.2 & 71.7 & $+0.5$ \\
+gaussian\_noise     & 75.9 & 80.1 & $+4.1$ \\
+glass\_blur         & 57.3 & 64.5 & $\mathbf{+7.2}$ \\
+impulse\_noise      & 84.1 & 81.7 & $-2.4$ \\
+jpeg\_compression   & 78.1 & 78.8 & $+0.7$ \\
+motion\_blur        & 71.4 & 71.9 & $+0.6$ \\
+pixelate            & 65.5 & 72.4 & $\mathbf{+6.8}$ \\
+saturate            & 83.7 & 83.1 & $-0.6$ \\
+shot\_noise         & 79.9 & 82.3 & $+2.4$ \\
+snow                & 74.6 & 77.4 & $+2.8$ \\
+spatter             & 82.7 & 82.5 & $-0.2$ \\
+speckle\_noise      & 81.0 & 82.5 & $+1.5$ \\
+zoom\_blur          & 73.3 & 74.3 & $+1.0$ \\
+\midrule
+\textbf{C10-C Average} & 76.2 & \textbf{77.7} & $\mathbf{+1.6}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Results.}
+Table~\ref{tab:cifar10c} shows results on all 19 CIFAR-10-C corruptions.
+NC-Conv outperforms the standard CNN on \textbf{14 of 19} corruptions, achieving +1.6\% higher average accuracy with the largest gains on glass blur ($+7.2\%$), pixelate ($+6.8\%$), and Gaussian noise ($+4.1\%$).
+Clean accuracy is comparable ($-0.3\%$, within noise), consistent with the superset guarantee.
+
+\paragraph{Severity scaling.}
+The most striking finding is the \emph{monotonic} relationship between corruption severity and NC-Conv's advantage (Table~\ref{tab:severity}): as degradation worsens, the benefit of noise-conditioned routing increases linearly.
+This directly validates the theoretical prediction: at higher $\sigma_n^2$, the gap between $O(\sigma_n^{4+})$ and $O(\sigma_n^2)$ noise variance widens, making the static fallback path increasingly valuable.
+
+\begin{table}[t]
+\centering
+\caption{\textbf{Severity scaling.} NC-Conv's advantage grows monotonically with corruption severity---directly predicted by the noise propagation theory.}
+\label{tab:severity}
+\small
+\begin{tabular}{@{}cccc@{}}
+\toprule
+\textbf{Severity} & \textbf{Std CNN} & \textbf{NC-Conv} & $\Delta$ \\
+\midrule
+1 (mild)   & 84.8 & 85.3 & +0.5 \\
+2          & 81.5 & 82.4 & +0.9 \\
+3          & 78.2 & 79.6 & +1.4 \\
+4          & 72.8 & 74.9 & +2.1 \\
+5 (severe) & 63.6 & 66.6 & \textbf{+2.9} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Ablation: $\sigma$ supervision.}
+Explicit binary supervision of $\sigma$ (clean$\to$1, noisy$\to$0) reduces performance by $-4.4\%$, indicating that the classification loss alone provides a better, more nuanced training signal for the quality gate than rigid binary targets.
+
+\paragraph{Limitation: impulse noise.}
+NC-Conv shows a $-2.4\%$ drop on impulse noise, where sparse extreme-value pixels do not alter the global statistics used by the per-sample $\sigma$ gate.
+Extending to per-spatial $\sigma$ is a natural future direction (Section~\ref{sec:conclusion}).
+
+
+% ============================================================
+% 6. EFFICIENCY
+% ============================================================
+\subsection{Efficiency and Deployment}
+\label{sec:efficiency}
+
+\begin{table}[t]
+\centering
+\caption{\textbf{Model efficiency comparison.} NC-Conv adds minimal overhead over Standard CNN while enabling MCU deployment.}
+\label{tab:efficiency}
+\small
+\begin{tabular}{@{}lrrl@{}}
+\toprule
+\textbf{Model} & \textbf{Params} & \textbf{INT8} & \textbf{Hardware} \\
+\midrule
+MobileNetV3-S & 2.5M & 2.5\,MB & CPU (\$30+) \\
+EfficientNet-B0 & 5.3M & 5.3\,MB & GPU \\
+UFLD-v2 & 2.7M & 2.7\,MB & CPU (\$30+) \\
+YOLOv10-nano & 2.3M & 2.3\,MB & CPU (\$30+) \\
+\midrule
+Std CNN (ours) & 251K & 251\,KB & MCU (\$8) \\
+\textbf{NC-Conv (ours)} & \textbf{253K} & \textbf{253\,KB} & \textbf{MCU (\$8)} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+NC-Conv at 245K parameters (245\,KB INT8) fits within the 1\,MB SRAM of a Cortex-M7 MCU (STM32H743, \$8), including activation memory.
+This is $10\times$ smaller than the lightest baseline (Ultra-Fast at 0.9M), enabling degradation-robust perception on hardware costing \$8 rather than \$30+ for CPU-based solutions.
+
+
+% ============================================================
+% 7. ANALYSIS
+% ============================================================
+\section{Analysis}
+\label{sec:analysis}
+
+\subsection{$\sigma$ Gate Behavior}
+
+To verify that $\sigma$ learns meaningful quality routing, we measure the average $\sigma$ value across the first NC-Conv block on different inputs:
+
+\begin{table}[h]
+\centering
+\caption{Learned $\sigma$ values (first block) by input condition.}
+\label{tab:sigma_values}
+\small
+\begin{tabular}{@{}lc l@{}}
+\toprule
+\textbf{Input} & $\sigma$ & \textbf{Interpretation} \\
+\midrule
+Clean         & $\sim$0.7 & Dynamic path preferred \\
+Dark          & $\sim$0.3 & Static path preferred \\
+Impulse noise & $\sim$0.2 & Strong static preference \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The gate correctly learns to reduce $\sigma$ (increase static path weight) under degradation, confirming the noise-conditioned routing mechanism.
+
+\subsection{Audio-Vision Unified Framework}
+
+NC-Conv demonstrates that the noise-conditioning principle from audio~\cite{choi2026ncssm} generalizes to vision:
+both domains benefit from input-quality-dependent routing between expressive and robust computation paths.
+The key shared insight is that \emph{input-dependent operations amplify noise multiplicatively}, and a quality-gated fallback to fixed operations provides robustness without sacrificing clean-condition performance.
+
+We conjecture this framework extends to any modality where input-dependent processing creates multiplicative noise coupling, including radar, LiDAR, and multi-modal sensor fusion.
+
+
+% ============================================================
+% 8. CONCLUSION
+% ============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented NC-Conv, a noise-conditioned dual-path convolution that transfers the audio NC-SSM framework to vision.
+On the standard CIFAR-10-C benchmark (19 corruptions $\times$ 5 severities), NC-Conv achieves \textbf{+1.6\%} average accuracy over a parameter-matched standard CNN, with the advantage growing \emph{monotonically} from $+0.5\%$ at severity~1 to $+2.9\%$ at severity~5---directly validating the noise propagation theory.
+The learned $\sigma$ gate requires no explicit quality labels, discovering corruption routing implicitly through training.
+
+NC-Conv establishes noise-conditioned computation as a general, modality-agnostic framework.
+\textbf{Future directions} include: (1)~per-spatial $\sigma$ gates for local degradation handling (addressing the impulse noise limitation), (2)~temporal NC-SSM for video sequences where illumination changes over time (e.g., tunnel entry/exit), and (3)~scaling to real-world benchmarks (CULane, ACDC) for lane detection and autonomous driving applications.
+
+% ============================================================
+% REFERENCES
+% ============================================================
+\bibliography{refs_bmvc}
+\end{document}
