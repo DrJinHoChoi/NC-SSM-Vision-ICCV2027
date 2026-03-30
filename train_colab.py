@@ -1690,6 +1690,45 @@ def noise_aware_bypass(original, enhanced, bypass_threshold=-2.0,
     return gate * original + (1 - gate) * enhanced
 
 
+def stft_bypass_blend(original, enhanced, threshold=-5.0, scale=5.0,
+                      n_fft=512, hop_length=160, noise_frames=5):
+    """STFT-based SNR estimation + smooth sigmoid bypass.
+
+    More accurate than waveform-power estimation because:
+    1. STFT separates frequency content → noise floor from low-energy frames
+    2. Matches the model's internal SNR estimator (same STFT pipeline)
+    3. Smooth sigmoid blending avoids hard switching artifacts
+
+    Args:
+        original: (B, T) noisy audio before SS
+        enhanced: (B, T) audio after SS
+        threshold: SNR (dB) below which SS is fully applied (default -5)
+        scale: sigmoid steepness (default 5.0, ~2dB transition zone)
+    Returns:
+        output: (B, T) smoothly blended audio
+    """
+    window = torch.hann_window(n_fft, device=original.device)
+    spec = torch.stft(original, n_fft, hop_length,
+                      window=window, return_complex=True)
+    mag = spec.abs()  # (B, F, T_frames)
+
+    # Noise floor from first N frames (same as SNREstimator)
+    noise_floor = mag[:, :, :noise_frames].mean(dim=2).clamp(min=1e-5)  # (B, F)
+    # Signal power across all frames
+    signal_mean = mag.mean(dim=2)  # (B, F)
+
+    # Broadband SNR in dB
+    snr_per_band = signal_mean / (noise_floor + 1e-8)  # (B, F)
+    snr_avg = snr_per_band.mean(dim=1)  # (B,)
+    snr_db = 10 * torch.log10(snr_avg.clamp(min=1e-8))  # (B,)
+
+    # Smooth sigmoid gate: low SNR → 0 (use SS), high SNR → 1 (bypass)
+    gate = torch.sigmoid(scale * (snr_db - threshold))  # (B,)
+    gate = gate.unsqueeze(1)  # (B, 1) for broadcast
+
+    return gate * original + (1 - gate) * enhanced
+
+
 # ============================================================================
 # Auxiliary Routing Loss: Gate Target Computation (DualPCEN v2)
 # ============================================================================
@@ -1814,14 +1853,16 @@ def evaluate_noisy(model, val_loader, device, noise_type='factory',
         noisy_audio = mix_audio_at_snr(audio, noise, snr_db)
         if use_enhancer:
             if enhancer_bypass:
-                # Known-SNR bypass: below threshold → SS, above → pass
-                if snr_db <= bypass_threshold:
-                    # Low SNR: apply SS 100%
-                    if enhancer_type == 'gtcrn' and gtcrn_model is not None:
-                        noisy_audio = gtcrn_enhance(noisy_audio, gtcrn_model)
-                    else:
-                        noisy_audio = ss_fn(noisy_audio)
-                # else: high SNR → keep original (bypass)
+                original = noisy_audio.clone()
+                if enhancer_type == 'gtcrn' and gtcrn_model is not None:
+                    enhanced = gtcrn_enhance(noisy_audio, gtcrn_model)
+                else:
+                    enhanced = ss_fn(noisy_audio)
+                # STFT-based SNR estimation (more accurate than waveform power)
+                noisy_audio = stft_bypass_blend(
+                    original, enhanced,
+                    threshold=bypass_threshold,
+                    scale=bypass_scale)
             else:
                 if enhancer_type == 'gtcrn' and gtcrn_model is not None:
                     noisy_audio = gtcrn_enhance(noisy_audio, gtcrn_model)
