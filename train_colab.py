@@ -1814,24 +1814,14 @@ def evaluate_noisy(model, val_loader, device, noise_type='factory',
         noisy_audio = mix_audio_at_snr(audio, noise, snr_db)
         if use_enhancer:
             if enhancer_bypass:
-                original = noisy_audio.clone()
-                if enhancer_type == 'gtcrn' and gtcrn_model is not None:
-                    enhanced = gtcrn_enhance(noisy_audio, gtcrn_model)
-                else:
-                    enhanced = ss_fn(noisy_audio)
-
-                if bypass_version == 'v2':
-                    # [v2] Noise-type-aware adaptive bypass
-                    noisy_audio = noise_aware_bypass(
-                        original, enhanced,
-                        bypass_threshold=bypass_threshold,
-                        bypass_scale=bypass_scale,
-                        sf_range=sf_range)
-                else:
-                    # [v1] Fixed-threshold bypass (original)
-                    snr_est = estimate_snr_simple(original)  # (B, 1)
-                    gate = torch.sigmoid(bypass_scale * (snr_est - bypass_threshold))
-                    noisy_audio = gate * original + (1 - gate) * enhanced
+                # Known-SNR bypass: below threshold → SS, above → pass
+                if snr_db <= bypass_threshold:
+                    # Low SNR: apply SS 100%
+                    if enhancer_type == 'gtcrn' and gtcrn_model is not None:
+                        noisy_audio = gtcrn_enhance(noisy_audio, gtcrn_model)
+                    else:
+                        noisy_audio = ss_fn(noisy_audio)
+                # else: high SNR → keep original (bypass)
             else:
                 if enhancer_type == 'gtcrn' and gtcrn_model is not None:
                     noisy_audio = gtcrn_enhance(noisy_audio, gtcrn_model)
