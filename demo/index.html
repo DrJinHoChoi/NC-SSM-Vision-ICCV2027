@@ -333,12 +333,119 @@ footer {
 .scene-card.active { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(37,99,235,0.15); }
 .scene-label { font-size: 0.75rem; font-weight: 600; margin-top: 6px; }
 
-/* Responsive */
+/* Responsive — Tablet */
 @media (max-width: 768px) {
+  nav { padding: 0 1rem; height: 56px; }
+  .nav-links { display: none; }
+  .nav-hamburger { display: flex; }
+  .hero { padding: 100px 1.5rem 60px; }
+  .hero h1 { font-size: 2rem; }
+  .hero p { font-size: 1rem; }
+  .hero-stats { flex-wrap: wrap; gap: 16px 32px; }
+  .stat-value { font-size: 1.5rem; }
+  .section { padding: 48px 1.2rem; }
+  .section h2 { font-size: 1.5rem; margin-bottom: 24px; }
   .demo-grid { grid-template-columns: 1fr; }
+  .demo-tabs { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .demo-tab { padding: 12px 16px; white-space: nowrap; font-size: 0.8rem; }
+  .demo-content { padding: 20px; }
   .viz-container { grid-template-columns: 1fr; }
-  .mcu-card { flex-direction: column; }
-  .hero-stats { gap: 24px; }
+  .mcu-card { flex-direction: column; padding: 24px; gap: 24px; }
+  .mcu-specs { grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .mcu-spec-value { font-size: 1.2rem; }
+  .results-table { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .sigma-grid { grid-template-columns: repeat(8, 1fr); gap: 2px; }
+  .sigma-cell { font-size: 0.5rem; }
+}
+
+/* Responsive — Mobile */
+@media (max-width: 480px) {
+  nav { padding: 0 0.75rem; height: 48px; }
+  .nav-brand { font-size: 0.95rem; }
+  .hero { padding: 80px 1rem 40px; }
+  .hero-eyebrow { font-size: 0.7rem; letter-spacing: 1.5px; }
+  .hero h1 { font-size: 1.6rem; }
+  .hero p { font-size: 0.9rem; margin-bottom: 24px; }
+  .hero-stats { flex-wrap: wrap; gap: 12px 20px; justify-content: center; }
+  .stat-value { font-size: 1.3rem; }
+  .stat-label { font-size: 0.65rem; }
+  .section { padding: 36px 1rem; }
+  .section h2 { font-size: 1.3rem; margin-bottom: 20px; }
+  .demo-tab { padding: 10px 12px; font-size: 0.75rem; }
+  .demo-content { padding: 16px; min-height: auto; }
+  .control-row { flex-direction: column; }
+  .slider-group { min-width: 100%; }
+  .mcu-card { padding: 20px; }
+  .mcu-info h3 { font-size: 1.1rem; }
+  .mcu-specs { grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .mcu-spec-value { font-size: 1rem; }
+  .mcu-spec-label { font-size: 0.6rem; }
+  footer { padding: 24px 1rem; font-size: 0.7rem; }
+}
+
+/* Mobile nav hamburger */
+.nav-hamburger {
+  display: none; flex-direction: column; gap: 4px; cursor: pointer;
+  padding: 8px; border: none; background: none;
+}
+.nav-hamburger span {
+  width: 20px; height: 2px; background: var(--text-primary); border-radius: 1px;
+  transition: all var(--transition);
+}
+
+/* Mobile nav overlay */
+.nav-mobile-menu {
+  display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(253,252,252,0.98); backdrop-filter: blur(20px);
+  z-index: 99; padding: 80px 2rem 2rem;
+  flex-direction: column; gap: 0;
+}
+.nav-mobile-menu.open { display: flex; }
+.nav-mobile-menu a {
+  color: var(--text-primary); text-decoration: none; font-size: 1.2rem;
+  font-weight: 500; padding: 16px 0; border-bottom: 1px solid var(--border);
+  display: block;
+}
+
+/* Force inline-styled grids/flexboxes to reflow on mobile */
+@media (max-width: 768px) {
+  /* Scene selector: 4col → 2col */
+  #tab-corruption > div:nth-child(2) { grid-template-columns: repeat(2, 1fr) !important; }
+  /* Tunnel frames: 8col → 4col */
+  #tab-tunnel > div:nth-child(2) { grid-template-columns: repeat(4, 1fr) !important; }
+  /* Frame detail: horizontal → vertical */
+  #frame-detail { flex-direction: column !important; }
+  #frame-detail img, #frame-img { width: 100% !important; }
+  /* Tunnel sidebar layout: flex → column */
+  #tab-tunnel > div:nth-child(4) { flex-direction: column !important; }
+  #tab-tunnel > div:nth-child(4) > div:last-child { width: 100% !important; }
+  /* Real-time video: side-by-side → stacked */
+  #realtime > div:nth-child(4) { flex-direction: column !important; }
+  /* Stat summary cards: 3col → 1col */
+  #tab-tunnel > div:nth-child(5) { flex-direction: column !important; }
+  #tab-culane > div:last-child { flex-direction: column !important; }
+  /* Temporal 4-col stats → 2col */
+  #temporal > div:nth-child(5) { grid-template-columns: repeat(2, 1fr) !important; }
+  /* Deployment strategy card: flex → column */
+  #temporal > div:nth-child(6) { flex-direction: column !important; padding: 24px !important; gap: 16px !important; }
+}
+
+@media (max-width: 480px) {
+  /* Tunnel frames: 4col on small */
+  #tab-tunnel > div:nth-child(2) { grid-template-columns: repeat(4, 1fr) !important; gap: 4px !important; }
+  /* Temporal 4-col stats → 1col */
+  #temporal > div:nth-child(5) { grid-template-columns: 1fr !important; }
+  /* CULane bar chart: tighter */
+  #culane-bars > div:first-child { gap: 12px !important; height: 160px !important; }
+}
+
+/* Touch-friendly: larger tap targets */
+@media (hover: none) and (pointer: coarse) {
+  .scene-card { padding: 10px; }
+  .control-btn { padding: 10px 18px; font-size: 0.85rem; }
+  .demo-tab { padding: 14px 16px; }
+  input[type="range"]::-webkit-slider-thumb { width: 24px; height: 24px; }
+  #play-btn, #speed-btn { padding: 14px 32px; font-size: 0.9rem; }
 }
 </style>
 </head>
@@ -359,7 +466,19 @@ footer {
     <a href="https://github.com/DrJinHoChoi/NC-SSM-Vision-ICCV2027" target="_blank">GitHub</a>
     <a href="#">Paper <span class="nav-badge">ACCV 2026</span></a>
   </div>
+  <button class="nav-hamburger" onclick="toggleMobileMenu()" aria-label="Menu">
+    <span></span><span></span><span></span>
+  </button>
 </nav>
+<div class="nav-mobile-menu" id="mobile-menu">
+  <a href="#demo" onclick="closeMobileMenu()">Demo</a>
+  <a href="#realtime" onclick="closeMobileMenu()">Real-time</a>
+  <a href="#results" onclick="closeMobileMenu()">Results</a>
+  <a href="#temporal" onclick="closeMobileMenu()">Temporal</a>
+  <a href="#deploy" onclick="closeMobileMenu()">Deploy</a>
+  <a href="https://github.com/DrJinHoChoi/NC-SSM-Vision-ICCV2027" target="_blank" onclick="closeMobileMenu()">GitHub</a>
+  <a href="#" onclick="closeMobileMenu()">Paper (ACCV 2026)</a>
+</div>
 
 <!-- Hero -->
 <section class="hero">
@@ -732,6 +851,16 @@ footer {
 </footer>
 
 <script>
+// Mobile menu
+function toggleMobileMenu() {
+  document.getElementById('mobile-menu').classList.toggle('open');
+  document.body.style.overflow = document.getElementById('mobile-menu').classList.contains('open') ? 'hidden' : '';
+}
+function closeMobileMenu() {
+  document.getElementById('mobile-menu').classList.remove('open');
+  document.body.style.overflow = '';
+}
+
 // Corruption demo data
 const corruptionData = {
   none:     {std: 89.2, nc: 88.9, sigma: 0.88},
